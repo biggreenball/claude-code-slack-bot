@@ -36,12 +36,11 @@
     "event_subscriptions": {
       "bot_events": [
         "app_mention",
-        "message.im",
-        "member_joined_channel"
+        "message.im"
       ]
     },
     "interactivity": {
-      "is_enabled": false
+      "is_enabled": true
     },
     "org_deploy_enabled": false,
     "socket_mode_enabled": true,
