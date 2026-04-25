@@ -41,6 +41,7 @@ export function validateConfig() {
     'SLACK_APP_TOKEN',
     'SLACK_SIGNING_SECRET',
     'ALLOWED_SLACK_USER_IDS',
+    'APPROVAL_HMAC_SECRET',
   ];
 
   const missing = required.filter((key) => !process.env[key]);
