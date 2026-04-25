@@ -1,4 +1,4 @@
-import { App } from '@slack/bolt';
+import { App, LogLevel } from '@slack/bolt';
 import { config, validateConfig } from './config';
 import { ClaudeHandler } from './claude-handler';
 import { SlackHandler } from './slack-handler';
@@ -24,6 +24,22 @@ async function start() {
       signingSecret: config.slack.signingSecret,
       socketMode: true,
       appToken: config.slack.appToken,
+      logLevel: config.debug ? LogLevel.DEBUG : LogLevel.INFO,
+    });
+
+    // Global middleware: log every incoming payload so we can diagnose missing
+    // action routing (e.g., Slack delivering vs. action_id matching).
+    app.use(async ({ body, next }: any) => {
+      try {
+        const payloadType = body?.type || body?.event?.type || 'unknown';
+        const actionIds = Array.isArray(body?.actions)
+          ? body.actions.map((a: any) => a?.action_id)
+          : undefined;
+        logger.info('incoming Slack payload', { payloadType, actionIds });
+      } catch {
+        /* no-op */
+      }
+      await next();
     });
 
     // Initialize MCP manager

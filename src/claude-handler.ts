@@ -62,7 +62,7 @@ export class ClaudeHandler {
       const permissionServer = {
         'permission-prompt': {
           command: 'npx',
-          args: ['tsx', `${import.meta.dirname}/permission-mcp-server.ts`],
+          args: ['tsx', `${process.cwd()}/src/permission-mcp-server.ts`],
           env: {
             SLACK_BOT_TOKEN: process.env.SLACK_BOT_TOKEN,
             SLACK_CONTEXT: JSON.stringify(slackContext)
@@ -81,18 +81,32 @@ export class ClaudeHandler {
     
     if (options.mcpServers && Object.keys(options.mcpServers).length > 0) {
       // Allow all MCP tools by default, plus permission prompt tool
-      const defaultMcpTools = this.mcpManager.getDefaultAllowedTools();
+      const allowedTools = this.mcpManager.getDefaultAllowedTools();
       if (slackContext) {
-        defaultMcpTools.push('mcp__permission-prompt');
+        allowedTools.push('mcp__permission-prompt');
+        // Auto-approve read-only built-in tools so Slack isn't spammed with
+        // a button prompt every time Claude reads a file or searches. Anything
+        // that mutates state (Bash, Edit, Write, NotebookEdit, Task) still
+        // routes through the permission-prompt MCP → ✅/❌ buttons.
+        allowedTools.push(
+          'Read',
+          'Glob',
+          'Grep',
+          'LS',
+          'WebSearch',
+          'WebFetch',
+          'NotebookRead',
+          'TodoWrite',
+        );
       }
-      if (defaultMcpTools.length > 0) {
-        options.allowedTools = defaultMcpTools;
+      if (allowedTools.length > 0) {
+        options.allowedTools = allowedTools;
       }
-      
+
       this.logger.debug('Added MCP configuration to options', {
         serverCount: Object.keys(options.mcpServers).length,
         servers: Object.keys(options.mcpServers),
-        allowedTools: defaultMcpTools,
+        allowedTools,
         hasSlackContext: !!slackContext,
       });
     }
@@ -104,12 +118,13 @@ export class ClaudeHandler {
       this.logger.debug('Starting new Claude conversation');
     }
 
+    options.abortController = abortController || new AbortController();
+
     this.logger.debug('Claude query options', options);
 
     try {
       for await (const message of query({
         prompt,
-        abortController: abortController || new AbortController(),
         options,
       })) {
         if (message.type === 'system' && message.subtype === 'init') {

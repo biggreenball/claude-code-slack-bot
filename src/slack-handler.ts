@@ -6,7 +6,7 @@ import { WorkingDirectoryManager } from './working-directory-manager';
 import { FileHandler, ProcessedFile } from './file-handler';
 import { TodoManager, Todo } from './todo-manager';
 import { McpManager } from './mcp-manager';
-import { permissionServer } from './permission-mcp-server';
+import { permissionServer, writeApprovalDecision } from './permission-mcp-server';
 import { config } from './config';
 
 interface MessageEvent {
@@ -47,6 +47,29 @@ export class SlackHandler {
     this.workingDirManager = new WorkingDirectoryManager();
     this.fileHandler = new FileHandler();
     this.todoManager = new TodoManager();
+    this.logger.info('Access allowlist configured', {
+      userCount: config.access.allowedSlackUserIds.size,
+      channelCount: config.access.allowedSlackChannelIds.size,
+      allowDms: config.access.allowDms,
+    });
+  }
+
+  private isUserAllowed(userId: string | undefined): boolean {
+    if (!userId) return false;
+    return config.access.allowedSlackUserIds.has(userId);
+  }
+
+  private isChannelAllowed(channelId: string | undefined): boolean {
+    if (!channelId) return false;
+    // DMs have channel IDs starting with 'D'
+    if (channelId.startsWith('D')) return config.access.allowDms;
+    return config.access.allowedSlackChannelIds.has(channelId);
+  }
+
+  private isAllowed(userId: string | undefined, channelId?: string): boolean {
+    if (!this.isUserAllowed(userId)) return false;
+    if (channelId !== undefined && !this.isChannelAllowed(channelId)) return false;
+    return true;
   }
 
   async handleMessage(event: MessageEvent, say: any) {
@@ -237,10 +260,12 @@ export class SlackHandler {
       // Add thinking reaction to original message (but don't spam if already set)
       await this.updateMessageReaction(sessionKey, '🤔');
       
-      // Create Slack context for permission prompts
+      // Create Slack context for permission prompts. Fall back to ts so that
+      // top-level @-mentions (where thread_ts is undefined) still get their
+      // approval cards posted into the thread the bot replies in, not at root.
       const slackContext = {
         channel,
-        threadTs: thread_ts,
+        threadTs: thread_ts || ts,
         user
       };
       
@@ -409,29 +434,32 @@ export class SlackHandler {
     return null;
   }
 
+  // Tools that route through the permission-prompt MCP (and therefore already
+  // get a Slack approval card showing what they're about to do). Suppress the
+  // redundant post-approval diff message so the approval card stays as the
+  // last visible item in the thread before the user clicks.
+  private static readonly GATED_TOOLS = new Set([
+    'Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'Bash', 'Task',
+  ]);
+
   private formatToolUse(content: any[]): string {
     const parts: string[] = [];
-    
+
     for (const part of content) {
       if (part.type === 'text') {
         parts.push(part.text);
       } else if (part.type === 'tool_use') {
         const toolName = part.name;
         const input = part.input;
-        
+
+        // Gated tools — approval card already covers it, skip.
+        if (SlackHandler.GATED_TOOLS.has(toolName)) {
+          continue;
+        }
+
         switch (toolName) {
-          case 'Edit':
-          case 'MultiEdit':
-            parts.push(this.formatEditTool(toolName, input));
-            break;
-          case 'Write':
-            parts.push(this.formatWriteTool(input));
-            break;
           case 'Read':
             parts.push(this.formatReadTool(input));
-            break;
-          case 'Bash':
-            parts.push(this.formatBashTool(input));
             break;
           case 'TodoWrite':
             // Handle TodoWrite separately - don't include in regular tool output
@@ -441,7 +469,7 @@ export class SlackHandler {
         }
       }
     }
-    
+
     return parts.join('\n\n');
   }
 
@@ -716,6 +744,12 @@ export class SlackHandler {
     // Handle direct messages
     this.app.message(async ({ message, say }) => {
       if (message.subtype === undefined && 'user' in message) {
+        const user = (message as any).user;
+        const channel = (message as any).channel;
+        if (!this.isAllowed(user, channel)) {
+          this.logger.warn('Rejected message', { user, channel });
+          return;
+        }
         this.logger.info('Handling direct message event');
         await this.handleMessage(message as MessageEvent, say);
       }
@@ -723,6 +757,10 @@ export class SlackHandler {
 
     // Handle app mentions
     this.app.event('app_mention', async ({ event, say }) => {
+      if (!this.isAllowed(event.user, event.channel)) {
+        this.logger.warn('Rejected mention', { user: event.user, channel: event.channel });
+        return;
+      }
       this.logger.info('Handling app mention event');
       const text = event.text.replace(/<@[^>]+>/g, '').trim();
       await this.handleMessage({
@@ -735,6 +773,12 @@ export class SlackHandler {
     this.app.event('message', async ({ event, say }) => {
       // Only handle file uploads that are not from bots and have files
       if (event.subtype === 'file_share' && 'user' in event && event.files) {
+        const user = (event as any).user;
+        const channel = (event as any).channel;
+        if (!this.isAllowed(user, channel)) {
+          this.logger.warn('Rejected file upload', { user, channel });
+          return;
+        }
         this.logger.info('Handling file upload event');
         await this.handleMessage(event as MessageEvent, say);
       }
@@ -752,11 +796,20 @@ export class SlackHandler {
     // Handle permission approval button clicks
     this.app.action('approve_tool', async ({ ack, body, respond }) => {
       await ack();
+      const userId = (body as any).user?.id;
+      const channelId = (body as any).channel?.id;
+      if (!this.isAllowed(userId, channelId)) {
+        this.logger.warn('Rejected approve click', { user: userId, channel: channelId });
+        await respond({ response_type: 'ephemeral', text: 'Not authorized.' });
+        return;
+      }
       const approvalId = (body as any).actions[0].value;
       this.logger.info('Tool approval granted', { approvalId });
-      
-      permissionServer.resolveApproval(approvalId, true);
-      
+
+      // Write decision to disk so the MCP subprocess (different process) sees it.
+      writeApprovalDecision(approvalId, { behavior: 'allow', message: 'Approved by user' });
+      permissionServer.resolveApproval(approvalId, true); // belt-and-suspenders
+
       await respond({
         response_type: 'ephemeral',
         text: '✅ Tool execution approved'
@@ -766,11 +819,19 @@ export class SlackHandler {
     // Handle permission denial button clicks
     this.app.action('deny_tool', async ({ ack, body, respond }) => {
       await ack();
+      const userId = (body as any).user?.id;
+      const channelId = (body as any).channel?.id;
+      if (!this.isAllowed(userId, channelId)) {
+        this.logger.warn('Rejected deny click', { user: userId, channel: channelId });
+        await respond({ response_type: 'ephemeral', text: 'Not authorized.' });
+        return;
+      }
       const approvalId = (body as any).actions[0].value;
       this.logger.info('Tool approval denied', { approvalId });
-      
+
+      writeApprovalDecision(approvalId, { behavior: 'deny', message: 'Denied by user' });
       permissionServer.resolveApproval(approvalId, false);
-      
+
       await respond({
         response_type: 'ephemeral',
         text: '❌ Tool execution denied'
