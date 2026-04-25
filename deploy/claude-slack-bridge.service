@@ -18,6 +18,12 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=claude-slack-bridge
 
+# Persistent state directory for in-flight approval IPC files.
+# systemd creates /var/lib/claude-slack-bridge with mode 0700 owned by the
+# service user, so files survive reboot but other users can't read them.
+StateDirectory=claude-slack-bridge
+StateDirectoryMode=0700
+
 # Resource cap — generous but prevents a runaway from wedging TRC1.
 MemoryMax=2G
 

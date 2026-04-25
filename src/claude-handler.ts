@@ -65,7 +65,10 @@ export class ClaudeHandler {
           args: ['tsx', `${process.cwd()}/src/permission-mcp-server.ts`],
           env: {
             SLACK_BOT_TOKEN: process.env.SLACK_BOT_TOKEN,
-            SLACK_CONTEXT: JSON.stringify(slackContext)
+            SLACK_CONTEXT: JSON.stringify(slackContext),
+            // Pass the HMAC secret only to the permission-prompt MCP, not to
+            // any other subprocess (Claude tool execution doesn't get it).
+            APPROVAL_HMAC_SECRET: process.env.APPROVAL_HMAC_SECRET,
           }
         }
       };
