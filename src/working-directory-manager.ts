@@ -121,6 +121,17 @@ export class WorkingDirectoryManager {
       return channelConfig.directory;
     }
 
+    // Fall back to global default if configured (survives bot restarts).
+    if (config.defaultWorkingDirectory) {
+      const resolved = this.resolveDirectory(config.defaultWorkingDirectory);
+      if (resolved) {
+        this.logger.debug('Using DEFAULT_WORKING_DIRECTORY env fallback', {
+          directory: resolved,
+        });
+        return resolved;
+      }
+    }
+
     this.logger.debug('No working directory configured', { channelId, threadTs });
     return undefined;
   }

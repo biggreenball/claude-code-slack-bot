@@ -1,0 +1,28 @@
+[Unit]
+Description=Claude Slack Bridge — personal Slack → Claude Code CLI transport
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/claude-slack-bridge
+EnvironmentFile=/opt/claude-slack-bridge/.env
+Environment=NODE_ENV=production
+Environment=HOME=/root
+ExecStart=/opt/claude-slack-bridge/node_modules/.bin/tsx src/index.ts
+Restart=always
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-slack-bridge
+
+# Resource cap — generous but prevents a runaway from wedging TRC1.
+MemoryMax=2G
+
+# No filesystem sandboxing (PrivateTmp/ProtectSystem/etc.) — Claude Code needs
+# unrestricted root filesystem access, that's the whole point of this bot.
+
+[Install]
+WantedBy=multi-user.target

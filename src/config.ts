@@ -16,7 +16,23 @@ export const config = {
     useVertex: process.env.CLAUDE_CODE_USE_VERTEX === '1',
   },
   baseDirectory: process.env.BASE_DIRECTORY || '',
+  defaultWorkingDirectory: process.env.DEFAULT_WORKING_DIRECTORY || '',
   debug: process.env.DEBUG === 'true' || process.env.NODE_ENV === 'development',
+  access: {
+    allowedSlackUserIds: new Set(
+      (process.env.ALLOWED_SLACK_USER_IDS || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ),
+    allowedSlackChannelIds: new Set(
+      (process.env.ALLOWED_SLACK_CHANNEL_IDS || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ),
+    allowDms: process.env.ALLOW_DMS === 'true',
+  },
 };
 
 export function validateConfig() {
@@ -24,6 +40,7 @@ export function validateConfig() {
     'SLACK_BOT_TOKEN',
     'SLACK_APP_TOKEN',
     'SLACK_SIGNING_SECRET',
+    'ALLOWED_SLACK_USER_IDS',
   ];
 
   const missing = required.filter((key) => !process.env[key]);

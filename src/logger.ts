@@ -19,12 +19,16 @@ export class Logger {
 
   debug(message: string, data?: any) {
     if (config.debug) {
-      console.log(this.formatMessage('DEBUG', message, data));
+      // Route to stderr, not stdout. The permission-prompt MCP subprocess uses
+      // stdout for JSON-RPC traffic with Claude Code; any stray stdout writes
+      // (like log lines) corrupt the protocol and silently break approvals.
+      console.error(this.formatMessage('DEBUG', message, data));
     }
   }
 
   info(message: string, data?: any) {
-    console.log(this.formatMessage('INFO', message, data));
+    // See debug() above — must go to stderr for MCP subprocess safety.
+    console.error(this.formatMessage('INFO', message, data));
   }
 
   warn(message: string, data?: any) {
