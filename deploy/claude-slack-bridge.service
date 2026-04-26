@@ -2,6 +2,10 @@
 Description=Claude Slack Bridge — personal Slack → Claude Code CLI transport
 After=network-online.target
 Wants=network-online.target
+# Restart unbounded normally, but cap restart-loop frequency below to avoid
+# burning CPU if the bot crashes immediately on startup.
+StartLimitBurst=5
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple
@@ -24,11 +28,20 @@ SyslogIdentifier=claude-slack-bridge
 StateDirectory=claude-slack-bridge
 StateDirectoryMode=0700
 
-# Resource cap — generous but prevents a runaway from wedging TRC1.
+# Resource caps — generous but prevent runaways from wedging TRC1.
 MemoryMax=2G
+LimitNOFILE=8192
+TasksMax=512
+
+# Keep the OOM killer away — this bot is more important than transient memory
+# pressure recovery; if the bot OOMs we want to know via crash, not silent
+# eviction.
+OOMScoreAdjust=-1000
 
 # No filesystem sandboxing (PrivateTmp/ProtectSystem/etc.) — Claude Code needs
 # unrestricted root filesystem access, that's the whole point of this bot.
+# CapabilityBoundingSet is similarly left wide because we run as root and
+# Claude tools need full capability set.
 
 [Install]
 WantedBy=multi-user.target

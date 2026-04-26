@@ -87,6 +87,37 @@ function assertValidApprovalId(approvalId: string): void {
   }
 }
 
+// Hard-deny patterns. Returns reason string if the request would terminate or
+// destroy the bot's own runtime, otherwise null. Checked BEFORE thread
+// auto-approval and BEFORE posting an approval card — even an auto-approved
+// thread can't push a self-kill through. Bypassable via shell tricks
+// (base64, eval, write-then-run) — this raises the bar against casual prompt
+// injection but is not a true sandbox. The real fix is non-root tool exec
+// (see PUNCHLIST). Conservative bias: false-deny is recoverable (SSH in);
+// false-allow takes the bot offline.
+const DENIED_BASH_PATTERNS: Array<{ re: RegExp; reason: string }> = [
+  { re: /\bpkill\b/i, reason: 'pkill (bot may be the target)' },
+  { re: /\bkillall\b/i, reason: 'killall (bot may be the target)' },
+  { re: /\bkill\s+(-\w+\s+)?-?\d+/i, reason: 'kill <pid> (bot pid may be the target)' },
+  { re: /\bsystemctl\s+\S*\s*(stop|disable|mask|kill|restart|reload)\s+claude-slack-bridge\b/i, reason: 'systemctl stop/disable/restart claude-slack-bridge' },
+  { re: /\bsystemctl\s+(stop|disable|mask|kill|restart|reload)\s+claude-slack-bridge\b/i, reason: 'systemctl stop/disable/restart claude-slack-bridge' },
+  { re: /\b(shutdown|halt|poweroff|reboot)\b/i, reason: 'shutdown/halt/poweroff/reboot' },
+  { re: /\binit\s+0\b/i, reason: 'init 0' },
+  { re: /\brm\s+(-[rRf]+\s+)*[^\s]*\/var\/lib\/claude-slack-bridge/i, reason: 'rm /var/lib/claude-slack-bridge (state dir)' },
+  { re: /\brm\s+(-[rRf]+\s+)*[^\s]*\/opt\/claude-slack-bridge/i, reason: 'rm /opt/claude-slack-bridge (install dir)' },
+  { re: /\brm\s+(-[rRf]+\s+)*\/(\s|$)/, reason: 'rm /' },
+];
+
+function screenForDangerousCommand(toolName: string, input: any): string | null {
+  if (toolName !== 'Bash') return null;
+  const cmd: unknown = input?.command;
+  if (typeof cmd !== 'string' || !cmd) return null;
+  for (const { re, reason } of DENIED_BASH_PATTERNS) {
+    if (re.test(cmd)) return reason;
+  }
+  return null;
+}
+
 class PermissionMCPServer {
   private server: Server;
   private slack: WebClient;
@@ -161,6 +192,24 @@ class PermissionMCPServer {
     const slackContextStr = process.env.SLACK_CONTEXT;
     const slackContext = slackContextStr ? JSON.parse(slackContextStr) : {};
     const { channel, threadTs: thread_ts, user, threadAutoApproved } = slackContext;
+
+    // Hard-deny self-kill / self-destroy commands BEFORE auto-approval kicks in.
+    // Even a thread the user opted into auto-approve can't push these through.
+    const denyReason = screenForDangerousCommand(tool_name, input);
+    if (denyReason) {
+      logger.warn('Hard-denied dangerous command', { tool_name, reason: denyReason, user });
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify({
+              behavior: 'deny',
+              message: `Auto-denied — command matches a self-kill / self-destroy pattern (${denyReason}). If this was intentional, SSH directly to the host instead.`,
+            }),
+          },
+        ],
+      };
+    }
 
     // If thread has auto-approval enabled for this user, approve immediately
     if (threadAutoApproved) {

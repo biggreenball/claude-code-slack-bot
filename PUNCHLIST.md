@@ -11,12 +11,13 @@ Small fixes and known issues. Markers: 🔴 urgent / 🟡 important / 🟢 nice-
 - 🟡 [PR-B] Belt-and-suspenders redundancy — `slack-handler.ts` calls both `writeApprovalDecision()` and `permissionServer.resolveApproval()` (the latter calls the former). Pick one path.
 - 🟡 [PR-B] MCP subprocess startup failure surfaces as silent 5-min timeout. Detect spawn failure and surface immediately via Slack.
 - 🟡 [PR-B] Audit `journalctl -u claude-slack-bridge` for any leak of `SLACK_BOT_TOKEN` / `APPROVAL_HMAC_SECRET` from spawn-args or env-dump logging.
-- 🟡 [PR-C] Add `StartLimitBurst=5` and `StartLimitIntervalSec=60` to systemd unit; install to `/etc/systemd/system/`.
-- 🟡 [PR-C] Expand `deploy/README.md`: rollback runbook, health-check, token-rotation playbook (incl. `APPROVAL_HMAC_SECRET` rotation), debugging stuck approvals.
 
 ### True boundary follow-up
 
 - 🔴 **HMAC alone is defense-in-depth, not a real boundary.** A prompt-injected Claude tool running as the same user (root) can read `APPROVAL_HMAC_SECRET` from `/proc/<bot-pid>/environ` and forge approvals. Real fix requires out-of-band confirmation (TOTP, second-device reaction, external webhook, or running Claude tools under a non-root user). Schedule before financial data lands in scope per `project_saas_claude_bot.md`.
+- 🔴 **The PR-C Bash denylist is bypassable.** `bash -c "$(echo cGtpbGwgdHN4 | base64 -d)"`, `eval`, or write-script-then-execute will all slip past the regex. The denylist raises the bar against casual prompt injection but is not a sandbox. Same architectural fix as the HMAC item — non-root tool execution.
+- 🟡 **Thread auto-approval (`approve_thread_always` button) widens blast radius.** Once enabled, every subsequent gated tool in that thread runs without a card. A prompt-injected Claude session in an auto-approved thread can chain destructive ops with no human-in-the-loop. The PR-C Bash denylist still fires (good), but anything not in the denylist (Edit/Write of arbitrary paths, etc.) goes through. Consider auto-expiring auto-approval after N tools or M minutes.
+- 🟡 **`mcp__postgres__query` is auto-approved** — fine while no sensitive data lives in Postgres, but the moment financials land per `project_saas_claude_bot.md`, this needs to revert to gated.
 
 ### Dead code / cleanup
 
@@ -59,4 +60,7 @@ Small fixes and known issues. Markers: 🔴 urgent / 🟡 important / 🟢 nice-
 - ✅ [PR-B] writeApprovalDecision wrapped in try-catch; failures surface ephemerally instead of silent wedge
 - ✅ [PR-B] Drop redundant `permissionServer.resolveApproval()` call in slack-handler; deleted dead method on PermissionMCPServer; deleted dead `pendingApprovals` Map field
 - ✅ [PR-B] Renamed our debug env var to `BOT_DEBUG` so SDK's leaky `logForDebugging` (gated on `DEBUG`) stays quiet — closes the spawn-args token leak
+- ✅ [PR-C] systemd hardening: `StartLimitBurst=5` / `IntervalSec=60` (no restart-loop CPU burn), `OOMScoreAdjust=-1000`, `TasksMax=512`, `LimitNOFILE=8192`
+- ✅ [PR-C] Bash denylist in permission-prompt MCP: hard-deny `pkill`/`killall`/`kill <pid>`/`systemctl <action> claude-slack-bridge`/`shutdown`/`halt`/`reboot`/`init 0`/`rm` against state or install dirs. Pre-empts thread auto-approval — even an opted-in thread can't push a self-kill through.
+- ✅ [PR-C] Expanded `deploy/README.md` with first-time install, rollback, token rotation (Slack + HMAC), debugging stuck approvals, sanity checks
 - :white_check_mark: first end-to-end Slack approval test
