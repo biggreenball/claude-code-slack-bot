@@ -52,6 +52,10 @@ Small fixes and known issues. Markers: 🔴 urgent / 🟡 important / 🟢 nice-
 - ✅ [PR-A] Validate approvalId regex on read + write paths (path injection guard)
 - ✅ [PR-A] Approvals dir mode 0700 + decision files mode 0600
 - ✅ [PR-A] Move APPROVALS_DIR `/tmp/` → `/var/lib/claude-slack-bridge/approvals/` (survives reboot via systemd `StateDirectory=`)
+- ✅ Thread replies without mentions work when bot active in thread
+- ✅ Read-only MCP tools (GitHub, Git, filesystem, postgres, web-search) bypass approval prompts
+- ✅ "Always approve for thread" button enables auto-approval for specific threads
+- ✅ Enhanced Slack Block Kit formatting with rich text blocks for better message rendering
 - ✅ [PR-B] writeApprovalDecision wrapped in try-catch; failures surface ephemerally instead of silent wedge
 - ✅ [PR-B] Drop redundant `permissionServer.resolveApproval()` call in slack-handler; deleted dead method on PermissionMCPServer; deleted dead `pendingApprovals` Map field
 - ✅ [PR-B] Renamed our debug env var to `BOT_DEBUG` so SDK's leaky `logForDebugging` (gated on `DEBUG`) stays quiet — closes the spawn-args token leak

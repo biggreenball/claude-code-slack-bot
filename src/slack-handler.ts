@@ -414,11 +414,7 @@ export class SlackHandler {
               currentMessages.push(content);
               
               // Send each new piece of content as a separate message
-              const formatted = this.formatMessage(content, false);
-              await say({
-                text: formatted,
-                thread_ts: thread_ts || ts,
-              });
+              await this.sendFormattedMessage(say, content, thread_ts || ts, false);
             }
           }
         } else if (message.type === 'result') {
@@ -432,11 +428,7 @@ export class SlackHandler {
           if (message.subtype === 'success' && (message as any).result) {
             const finalResult = (message as any).result;
             if (finalResult && !currentMessages.includes(finalResult)) {
-              const formatted = this.formatMessage(finalResult, true);
-              await say({
-                text: formatted,
-                thread_ts: thread_ts || ts,
-              });
+              await this.sendFormattedMessage(say, finalResult, thread_ts || ts, true);
             }
           }
         }
@@ -841,17 +833,302 @@ export class SlackHandler {
     }
   }
 
-  private formatMessage(text: string, isFinal: boolean): string {
-    // Convert markdown code blocks to Slack format
+  private formatMessage(text: string, isFinal: boolean): string | any {
+    // Try to detect if this is a structured response that would benefit from rich blocks
+    if (this.shouldUseRichBlocks(text)) {
+      return this.createRichBlocks(text);
+    }
+
+    // Fallback: Convert GitHub-flavored markdown to Slack mrkdwn format
     let formatted = text
+      // Headers: Convert ### Header to *Header* (bold)
+      .replace(/^#{1,6}\s+(.+)$/gm, '*$1*')
+      // Code blocks: Preserve as-is (Slack supports these)
       .replace(/```(\w+)?\n([\s\S]*?)```/g, (_, lang, code) => {
         return '```' + code + '```';
       })
+      // Inline code: Preserve as-is
       .replace(/`([^`]+)`/g, '`$1`')
+      // Bold: Convert **text** to *text*
       .replace(/\*\*([^*]+)\*\*/g, '*$1*')
-      .replace(/__([^_]+)__/g, '_$1_');
+      // Italic: Convert __text__ to _text_
+      .replace(/__([^_]+)__/g, '_$1_')
+      // Strikethrough: Convert ~~text~~ to ~text~
+      .replace(/~~([^~]+)~~/g, '~$1~')
+      // Lists: Convert GitHub-style - to Slack bullets
+      .replace(/^[\s]*-\s+(.+)$/gm, '• $1')
+      // Lists: Convert numbered lists to bullets (Slack doesn't support numbered)
+      .replace(/^[\s]*\d+\.\s+(.+)$/gm, '• $1')
+      // Blockquotes: Preserve as-is (Slack supports > quotes)
+      .replace(/^>\s+(.+)$/gm, '> $1')
+      // Links: Convert [text](url) to <url|text> format for Slack
+      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<$2|$1>')
+      // Clean up multiple consecutive newlines (max 2)
+      .replace(/\n{3,}/g, '\n\n');
 
     return formatted;
+  }
+
+  private shouldUseRichBlocks(text: string): boolean {
+    // Use rich blocks for structured content that benefits from enhanced formatting
+    return /^(#{1,6}\s|```|\*\*|##\s|###\s|•|\d+\.|>)/m.test(text) ||
+           text.includes('✅') || text.includes('❌') || text.includes('🔄') ||
+           text.split('\n').length > 3;
+  }
+
+  private createRichBlocks(text: string): any {
+    const blocks: any[] = [];
+    const lines = text.split('\n');
+    let currentSection: any = null;
+    let currentList: any = null;
+    let inCodeBlock = false;
+    let codeContent = '';
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+
+      // Handle code blocks
+      if (line.startsWith('```')) {
+        if (inCodeBlock) {
+          // End code block
+          blocks.push({
+            type: 'rich_text',
+            elements: [{
+              type: 'rich_text_preformatted',
+              elements: [{
+                type: 'text',
+                text: codeContent.trim()
+              }]
+            }]
+          });
+          codeContent = '';
+          inCodeBlock = false;
+        } else {
+          // Start code block
+          this.finalizeCurrent(blocks, currentSection, currentList);
+          currentSection = null;
+          currentList = null;
+          inCodeBlock = true;
+        }
+        continue;
+      }
+
+      if (inCodeBlock) {
+        codeContent += line + '\n';
+        continue;
+      }
+
+      // Handle headers
+      const headerMatch = line.match(/^(#{1,6})\s+(.+)$/);
+      if (headerMatch) {
+        this.finalizeCurrent(blocks, currentSection, currentList);
+        blocks.push({
+          type: 'rich_text',
+          elements: [{
+            type: 'rich_text_section',
+            elements: [{
+              type: 'text',
+              text: headerMatch[2],
+              style: { bold: true }
+            }]
+          }]
+        });
+        currentSection = null;
+        currentList = null;
+        continue;
+      }
+
+      // Handle lists
+      const listMatch = line.match(/^[\s]*[-•]\s+(.+)$/) || line.match(/^[\s]*\d+\.\s+(.+)$/);
+      if (listMatch) {
+        if (!currentList) {
+          this.finalizeCurrent(blocks, currentSection, currentList);
+          currentSection = null;
+          currentList = {
+            type: 'rich_text',
+            elements: [{
+              type: 'rich_text_list',
+              style: 'bullet',
+              elements: []
+            }]
+          };
+        }
+
+        currentList.elements[0].elements.push({
+          type: 'rich_text_section',
+          elements: this.parseInlineFormatting(listMatch[1])
+        });
+        continue;
+      }
+
+      // Handle blockquotes
+      const quoteMatch = line.match(/^>\s+(.+)$/);
+      if (quoteMatch) {
+        this.finalizeCurrent(blocks, currentSection, currentList);
+        blocks.push({
+          type: 'rich_text',
+          elements: [{
+            type: 'rich_text_quote',
+            elements: [{
+              type: 'text',
+              text: quoteMatch[1]
+            }]
+          }]
+        });
+        currentSection = null;
+        currentList = null;
+        continue;
+      }
+
+      // Handle regular text
+      if (line.trim()) {
+        if (currentList) {
+          this.finalizeCurrent(blocks, currentSection, currentList);
+          currentList = null;
+        }
+
+        if (!currentSection) {
+          currentSection = {
+            type: 'rich_text',
+            elements: [{
+              type: 'rich_text_section',
+              elements: []
+            }]
+          };
+        }
+
+        if (currentSection.elements[0].elements.length > 0) {
+          currentSection.elements[0].elements.push({
+            type: 'text',
+            text: ' '
+          });
+        }
+
+        currentSection.elements[0].elements.push(...this.parseInlineFormatting(line));
+      } else if (currentSection) {
+        // Empty line - finalize current section
+        this.finalizeCurrent(blocks, currentSection, currentList);
+        currentSection = null;
+      }
+    }
+
+    // Finalize remaining content
+    this.finalizeCurrent(blocks, currentSection, currentList);
+
+    return { blocks };
+  }
+
+  private finalizeCurrent(blocks: any[], currentSection: any, currentList: any): void {
+    if (currentList) {
+      blocks.push(currentList);
+    } else if (currentSection && currentSection.elements[0].elements.length > 0) {
+      blocks.push(currentSection);
+    }
+  }
+
+  private parseInlineFormatting(text: string): any[] {
+    const elements: any[] = [];
+    let remaining = text;
+
+    // Parse inline formatting: **bold**, `code`, _italic_, ~~strike~~, [links](url)
+    const patterns = [
+      { regex: /\*\*([^*]+)\*\*/g, style: { bold: true } },
+      { regex: /`([^`]+)`/g, style: { code: true } },
+      { regex: /_([^_]+)_/g, style: { italic: true } },
+      { regex: /~~([^~]+)~~/g, style: { strike: true } },
+      { regex: /\[([^\]]+)\]\(([^)]+)\)/g, type: 'link' }
+    ];
+
+    let lastIndex = 0;
+    const matches: Array<{index: number, length: number, text: string, style?: any, type?: string, url?: string}> = [];
+
+    // Find all matches
+    patterns.forEach(pattern => {
+      const regex = new RegExp(pattern.regex.source, 'g');
+      let match;
+      while ((match = regex.exec(text)) !== null) {
+        if (pattern.type === 'link') {
+          matches.push({
+            index: match.index,
+            length: match[0].length,
+            text: match[1],
+            type: 'link',
+            url: match[2]
+          });
+        } else {
+          matches.push({
+            index: match.index,
+            length: match[0].length,
+            text: match[1],
+            style: pattern.style
+          });
+        }
+      }
+    });
+
+    // Sort matches by position
+    matches.sort((a, b) => a.index - b.index);
+
+    // Process matches
+    matches.forEach(match => {
+      // Add text before this match
+      if (match.index > lastIndex) {
+        const beforeText = text.substring(lastIndex, match.index);
+        if (beforeText) {
+          elements.push({ type: 'text', text: beforeText });
+        }
+      }
+
+      // Add the formatted match
+      if (match.type === 'link') {
+        elements.push({
+          type: 'link',
+          url: match.url,
+          text: match.text
+        });
+      } else {
+        elements.push({
+          type: 'text',
+          text: match.text,
+          style: match.style
+        });
+      }
+
+      lastIndex = match.index + match.length;
+    });
+
+    // Add remaining text
+    if (lastIndex < text.length) {
+      const remainingText = text.substring(lastIndex);
+      if (remainingText) {
+        elements.push({ type: 'text', text: remainingText });
+      }
+    }
+
+    // If no formatting found, return simple text
+    if (elements.length === 0) {
+      elements.push({ type: 'text', text });
+    }
+
+    return elements;
+  }
+
+  private async sendFormattedMessage(say: any, content: string, threadTs: string, isFinal: boolean = false): Promise<void> {
+    const formatted = this.formatMessage(content, isFinal);
+
+    if (typeof formatted === 'string') {
+      // Traditional text message
+      await say({
+        text: formatted,
+        thread_ts: threadTs,
+      });
+    } else {
+      // Rich blocks message
+      await say({
+        ...formatted,
+        thread_ts: threadTs,
+      });
+    }
   }
 
   setupEventHandlers() {
