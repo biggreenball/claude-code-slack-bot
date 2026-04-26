@@ -17,7 +17,11 @@ export const config = {
   },
   baseDirectory: process.env.BASE_DIRECTORY || '',
   defaultWorkingDirectory: process.env.DEFAULT_WORKING_DIRECTORY || '',
-  debug: process.env.DEBUG === 'true' || process.env.NODE_ENV === 'development',
+  // Use BOT_DEBUG (not DEBUG) — Anthropic's Claude Code SDK keys its own
+  // verbose mode on `DEBUG`, and that mode dumps spawn args (including the
+  // env block with our SLACK_BOT_TOKEN / APPROVAL_HMAC_SECRET) to stderr.
+  // Keeping `DEBUG` unset prevents that secret leak.
+  debug: process.env.BOT_DEBUG === 'true' || process.env.NODE_ENV === 'development',
   access: {
     allowedSlackUserIds: new Set(
       (process.env.ALLOWED_SLACK_USER_IDS || '')
