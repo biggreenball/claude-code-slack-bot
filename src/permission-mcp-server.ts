@@ -90,10 +90,6 @@ function assertValidApprovalId(approvalId: string): void {
 class PermissionMCPServer {
   private server: Server;
   private slack: WebClient;
-  private pendingApprovals = new Map<string, {
-    resolve: (response: PermissionResponse) => void;
-    reject: (error: Error) => void;
-  }>();
 
   constructor() {
     this.server = new Server(
@@ -164,7 +160,17 @@ class PermissionMCPServer {
     // Get Slack context from environment (passed by Claude handler)
     const slackContextStr = process.env.SLACK_CONTEXT;
     const slackContext = slackContextStr ? JSON.parse(slackContextStr) : {};
-    const { channel, threadTs: thread_ts, user } = slackContext;
+    const { channel, threadTs: thread_ts, user, threadAutoApproved } = slackContext;
+
+    // If thread has auto-approval enabled for this user, approve immediately
+    if (threadAutoApproved) {
+      logger.info('Auto-approving tool for thread', { tool_name, user, thread_ts });
+      return {
+        behavior: 'allow' as const,
+        updatedInput: input,
+        message: 'Auto-approved for thread'
+      };
+    }
 
     // Generate unique approval ID
     const approvalId = `approval_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -202,6 +208,15 @@ class PermissionMCPServer {
             style: "danger",
             action_id: "deny_tool",
             value: approvalId
+          },
+          {
+            type: "button",
+            text: {
+              type: "plain_text",
+              text: "🔄 Always approve for thread"
+            },
+            action_id: "approve_thread_always",
+            value: approvalId
           }
         ]
       },
@@ -224,6 +239,23 @@ class PermissionMCPServer {
         blocks,
         text: `Permission request for ${tool_name}` // Fallback text
       });
+
+      // Record the in-flight request so the bot's startup orphan-sweep can
+      // mark this card "expired" if we crash between here and chat.update().
+      // Best-effort — log on failure but don't bail (the approval flow itself
+      // can still proceed; only the cleanup-after-crash story is degraded).
+      if (result.ts && result.channel) {
+        try {
+          writeRequestRecord(approvalId, {
+            channel: result.channel,
+            ts: result.ts,
+            posted_at: Date.now(),
+            tool_name,
+          });
+        } catch (err: any) {
+          logger.warn('Failed to record in-flight request', { approvalId, error: err?.message });
+        }
+      }
 
       // Wait for user response
       const response = await this.waitForApproval(approvalId);
@@ -264,6 +296,10 @@ class PermissionMCPServer {
           text: `Permission ${response.behavior === 'allow' ? 'approved' : 'denied'} for ${tool_name}`
         });
       }
+
+      // Card has been finalized — clear the in-flight request record so the
+      // orphan sweep doesn't try to "expire" an already-resolved card later.
+      try { unlinkRequestRecord(approvalId); } catch { /* best-effort */ }
 
       return {
         content: [
@@ -339,21 +375,69 @@ class PermissionMCPServer {
     return { behavior: 'deny', message: 'Permission request timed out' };
   }
 
-  // Kept for backward compatibility / same-process callers; the cross-process
-  // path uses writeApprovalDecision() below instead.
-  public resolveApproval(approvalId: string, approved: boolean, updatedInput?: any) {
-    writeApprovalDecision(approvalId, {
-      behavior: approved ? 'allow' : 'deny',
-      updatedInput: updatedInput || undefined,
-      message: approved ? 'Approved by user' : 'Denied by user',
-    });
-  }
-
   async run() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
     logger.info('Permission MCP server started');
   }
+}
+
+// In-flight request record. Written by the MCP subprocess after it posts the
+// approval card to Slack; consumed by the main bot's startup orphan-sweep to
+// mark abandoned cards "expired" (covers the bot-crashed-mid-approval case).
+export interface RequestRecord {
+  channel: string;
+  ts: string;
+  posted_at: number;
+  tool_name: string;
+}
+
+function requestPathFor(approvalId: string): string {
+  assertValidApprovalId(approvalId);
+  return path.join(APPROVALS_DIR, `${approvalId}.request.json`);
+}
+
+export function writeRequestRecord(approvalId: string, rec: RequestRecord): void {
+  fs.mkdirSync(APPROVALS_DIR, { recursive: true, mode: 0o700 });
+  const finalPath = requestPathFor(approvalId);
+  const tmpPath = finalPath + '.tmp';
+  fs.writeFileSync(tmpPath, JSON.stringify({ approvalId, ...rec }), { mode: 0o600 });
+  fs.renameSync(tmpPath, finalPath);
+}
+
+export function unlinkRequestRecord(approvalId: string): void {
+  try { fs.unlinkSync(requestPathFor(approvalId)); } catch { /* best-effort */ }
+}
+
+export function listOrphanRequests(olderThanMs: number): Array<RequestRecord & { approvalId: string; filePath: string }> {
+  const out: Array<RequestRecord & { approvalId: string; filePath: string }> = [];
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(APPROVALS_DIR);
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') return out;
+    throw err;
+  }
+  const now = Date.now();
+  for (const name of entries) {
+    if (!name.endsWith('.request.json')) continue;
+    const filePath = path.join(APPROVALS_DIR, name);
+    try {
+      const raw = fs.readFileSync(filePath, 'utf-8');
+      const meta = JSON.parse(raw);
+      const age = now - (typeof meta.posted_at === 'number' ? meta.posted_at : 0);
+      if (age < olderThanMs) continue;
+      out.push({ ...meta, filePath });
+    } catch {
+      // Unparseable / partially-written — let caller decide whether to nuke.
+      out.push({
+        approvalId: name.replace(/\.request\.json$/, ''),
+        channel: '', ts: '', posted_at: 0, tool_name: 'unknown',
+        filePath,
+      });
+    }
+  }
+  return out;
 }
 
 // Cross-process IPC: write the approval decision to a file the MCP subprocess

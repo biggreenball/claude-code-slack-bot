@@ -101,6 +101,51 @@ export class ClaudeHandler {
           'NotebookRead',
           'TodoWrite',
         );
+
+        // Add common read-only MCP tools that don't require approval
+        // GitHub read operations
+        allowedTools.push(
+          'mcp__github__search_repositories',
+          'mcp__github__get_repository',
+          'mcp__github__list_issues',
+          'mcp__github__get_issue',
+          'mcp__github__list_pull_requests',
+          'mcp__github__get_pull_request',
+          'mcp__github__get_file_contents',
+          'mcp__github__list_repository_contents',
+        );
+
+        // Git read operations
+        allowedTools.push(
+          'mcp__git__log',
+          'mcp__git__show',
+          'mcp__git__diff',
+          'mcp__git__status',
+          'mcp__git__branch',
+          'mcp__git__ls_files',
+          'mcp__git__blame',
+        );
+
+        // Filesystem read operations
+        allowedTools.push(
+          'mcp__filesystem__read_file',
+          'mcp__filesystem__list_directory',
+          'mcp__filesystem__search_files',
+          'mcp__filesystem__get_file_info',
+        );
+
+        // Database read operations (SELECT queries only)
+        allowedTools.push(
+          'mcp__postgres__query',
+          'mcp__postgres__list_tables',
+          'mcp__postgres__describe_table',
+          'mcp__postgres__list_schemas',
+        );
+
+        // Web search operations
+        allowedTools.push(
+          'mcp__web-search__search',
+        );
       }
       if (allowedTools.length > 0) {
         options.allowedTools = allowedTools;

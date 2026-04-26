@@ -6,7 +6,8 @@ import { WorkingDirectoryManager } from './working-directory-manager';
 import { FileHandler, ProcessedFile } from './file-handler';
 import { TodoManager, Todo } from './todo-manager';
 import { McpManager } from './mcp-manager';
-import { permissionServer, writeApprovalDecision } from './permission-mcp-server';
+import * as fs from 'fs';
+import { writeApprovalDecision, listOrphanRequests } from './permission-mcp-server';
 import { config } from './config';
 
 interface MessageEvent {
@@ -30,6 +31,7 @@ export class SlackHandler {
   private app: App;
   private claudeHandler: ClaudeHandler;
   private activeControllers: Map<string, AbortController> = new Map();
+  private threadAutoApprovals = new Map<string, Set<string>>(); // threadKey -> userIds
   private logger = new Logger('SlackHandler');
   private workingDirManager: WorkingDirectoryManager;
   private fileHandler: FileHandler;
@@ -70,6 +72,98 @@ export class SlackHandler {
     if (!this.isUserAllowed(userId)) return false;
     if (channelId !== undefined && !this.isChannelAllowed(channelId)) return false;
     return true;
+  }
+
+  // Handles both approve_tool and deny_tool button clicks. Single write path
+  // to /var/lib/.../approvals (no in-process resolveApproval shim — that
+  // never worked across process boundaries, see PR-B notes). Errors during
+  // the write are surfaced ephemerally so a disk-full / dir-deleted condition
+  // doesn't silently wedge the user's tool call.
+  private async handleDecisionClick(
+    body: any,
+    respond: (msg: any) => Promise<unknown>,
+    behavior: 'allow' | 'deny',
+  ): Promise<void> {
+    const userId = body?.user?.id;
+    const channelId = body?.channel?.id;
+    if (!this.isAllowed(userId, channelId)) {
+      this.logger.warn('Rejected click', { behavior, user: userId, channel: channelId });
+      await respond({ response_type: 'ephemeral', text: 'Not authorized.' });
+      return;
+    }
+    const approvalId = body?.actions?.[0]?.value;
+    if (typeof approvalId !== 'string' || !approvalId) {
+      this.logger.warn('Click missing approvalId', { behavior, user: userId });
+      await respond({ response_type: 'ephemeral', text: 'Click was malformed (no approval id).' });
+      return;
+    }
+
+    this.logger.info('Tool approval click', { behavior, approvalId });
+
+    try {
+      writeApprovalDecision(approvalId, {
+        behavior,
+        message: behavior === 'allow' ? 'Approved by user' : 'Denied by user',
+      });
+    } catch (err: any) {
+      this.logger.error('Failed to persist decision', err);
+      await respond({
+        response_type: 'ephemeral',
+        text: `⚠️ Couldn't save your decision: ${err?.message || 'unknown error'}. The tool will time out after 5 min; try again or check the bot.`,
+      });
+      return;
+    }
+
+    await respond({
+      response_type: 'ephemeral',
+      text: behavior === 'allow' ? '✅ Tool execution approved' : '❌ Tool execution denied',
+    });
+  }
+
+  private async handleThreadAutoApproval(
+    body: any,
+    respond: (msg: any) => Promise<unknown>,
+  ): Promise<void> {
+    const userId = body?.user?.id;
+    const channelId = body?.channel?.id;
+    const threadTs = body?.message?.thread_ts;
+
+    if (!this.isAllowed(userId, channelId)) {
+      this.logger.warn('Rejected thread auto-approval click', { user: userId, channel: channelId });
+      await respond({ response_type: 'ephemeral', text: 'Not authorized.' });
+      return;
+    }
+
+    const approvalId = body?.actions?.[0]?.value;
+    if (typeof approvalId !== 'string' || !approvalId) {
+      this.logger.warn('Thread auto-approval click missing approvalId', { user: userId });
+      await respond({ response_type: 'ephemeral', text: 'Click was malformed (no approval id).' });
+      return;
+    }
+
+    // Enable thread auto-approval for this user
+    this.setThreadAutoApproval(channelId, threadTs, userId);
+
+    // Also approve the current request
+    try {
+      writeApprovalDecision(approvalId, {
+        behavior: 'allow',
+        message: 'Approved with thread auto-approval enabled',
+      });
+    } catch (err: any) {
+      this.logger.error('Failed to persist auto-approval decision', err);
+      await respond({
+        response_type: 'ephemeral',
+        text: `⚠️ Couldn't save your decision: ${err?.message || 'unknown error'}. The tool will time out after 5 min; try again or check the bot.`,
+      });
+      return;
+    }
+
+    const context = threadTs ? 'this thread' : 'this channel';
+    await respond({
+      response_type: 'ephemeral',
+      text: `🔄 Thread auto-approval enabled for ${context}. Future tool requests will be approved automatically.`,
+    });
   }
 
   async handleMessage(event: MessageEvent, say: any) {
@@ -266,7 +360,8 @@ export class SlackHandler {
       const slackContext = {
         channel,
         threadTs: thread_ts || ts,
-        user
+        user,
+        threadAutoApproved: this.isThreadAutoApproved(channel, thread_ts, user)
       };
       
       for await (const message of this.claudeHandler.streamQuery(finalPrompt, session, abortController, workingDirectory, slackContext)) {
@@ -692,6 +787,25 @@ export class SlackHandler {
     return this.botUserId;
   }
 
+  private getThreadKey(channelId: string, threadTs?: string): string {
+    return threadTs ? `${channelId}:${threadTs}` : channelId;
+  }
+
+  private isThreadAutoApproved(channelId: string, threadTs: string | undefined, userId: string): boolean {
+    const threadKey = this.getThreadKey(channelId, threadTs);
+    const approvedUsers = this.threadAutoApprovals.get(threadKey);
+    return approvedUsers?.has(userId) || false;
+  }
+
+  private setThreadAutoApproval(channelId: string, threadTs: string | undefined, userId: string): void {
+    const threadKey = this.getThreadKey(channelId, threadTs);
+    if (!this.threadAutoApprovals.has(threadKey)) {
+      this.threadAutoApprovals.set(threadKey, new Set());
+    }
+    this.threadAutoApprovals.get(threadKey)!.add(userId);
+    this.logger.info('Thread auto-approval enabled', { threadKey, userId });
+  }
+
   private async handleChannelJoin(channelId: string, say: any): Promise<void> {
     try {
       // Get channel info
@@ -769,18 +883,37 @@ export class SlackHandler {
       } as MessageEvent, say);
     });
 
-    // Handle file uploads in threads
+    // Handle thread replies without mentions (if bot has active session)
     this.app.event('message', async ({ event, say }) => {
-      // Only handle file uploads that are not from bots and have files
-      if (event.subtype === 'file_share' && 'user' in event && event.files) {
-        const user = (event as any).user;
-        const channel = (event as any).channel;
-        if (!this.isAllowed(user, channel)) {
-          this.logger.warn('Rejected file upload', { user, channel });
-          return;
-        }
+      // Skip bot messages, messages with subtypes (except file_share), and messages without users
+      if ('bot_id' in event || !('user' in event)) return;
+
+      const user = (event as any).user;
+      const channel = (event as any).channel;
+      const thread_ts = (event as any).thread_ts;
+
+      if (!this.isAllowed(user, channel)) {
+        return;
+      }
+
+      // Handle file uploads (original logic)
+      if (event.subtype === 'file_share' && event.files) {
         this.logger.info('Handling file upload event');
         await this.handleMessage(event as MessageEvent, say);
+        return;
+      }
+
+      // Handle thread replies without mentions (only if no subtype and in a thread)
+      if (!event.subtype && thread_ts) {
+        // Check if bot has an active session for this thread
+        const sessionKey = this.claudeHandler.getSessionKey(user, channel, thread_ts);
+        const session = this.claudeHandler.getSession(user, channel, thread_ts);
+
+        if (session) {
+          this.logger.info('Handling thread reply without mention');
+          await this.handleMessage(event as MessageEvent, say);
+          return;
+        }
       }
     });
 
@@ -796,46 +929,19 @@ export class SlackHandler {
     // Handle permission approval button clicks
     this.app.action('approve_tool', async ({ ack, body, respond }) => {
       await ack();
-      const userId = (body as any).user?.id;
-      const channelId = (body as any).channel?.id;
-      if (!this.isAllowed(userId, channelId)) {
-        this.logger.warn('Rejected approve click', { user: userId, channel: channelId });
-        await respond({ response_type: 'ephemeral', text: 'Not authorized.' });
-        return;
-      }
-      const approvalId = (body as any).actions[0].value;
-      this.logger.info('Tool approval granted', { approvalId });
-
-      // Write decision to disk so the MCP subprocess (different process) sees it.
-      writeApprovalDecision(approvalId, { behavior: 'allow', message: 'Approved by user' });
-      permissionServer.resolveApproval(approvalId, true); // belt-and-suspenders
-
-      await respond({
-        response_type: 'ephemeral',
-        text: '✅ Tool execution approved'
-      });
+      await this.handleDecisionClick(body, respond, 'allow');
     });
 
     // Handle permission denial button clicks
     this.app.action('deny_tool', async ({ ack, body, respond }) => {
       await ack();
-      const userId = (body as any).user?.id;
-      const channelId = (body as any).channel?.id;
-      if (!this.isAllowed(userId, channelId)) {
-        this.logger.warn('Rejected deny click', { user: userId, channel: channelId });
-        await respond({ response_type: 'ephemeral', text: 'Not authorized.' });
-        return;
-      }
-      const approvalId = (body as any).actions[0].value;
-      this.logger.info('Tool approval denied', { approvalId });
+      await this.handleDecisionClick(body, respond, 'deny');
+    });
 
-      writeApprovalDecision(approvalId, { behavior: 'deny', message: 'Denied by user' });
-      permissionServer.resolveApproval(approvalId, false);
-
-      await respond({
-        response_type: 'ephemeral',
-        text: '❌ Tool execution denied'
-      });
+    // Handle thread auto-approval button clicks
+    this.app.action('approve_thread_always', async ({ ack, body, respond }) => {
+      await ack();
+      await this.handleThreadAutoApproval(body, respond);
     });
 
     // Cleanup inactive sessions periodically
@@ -843,5 +949,58 @@ export class SlackHandler {
       this.logger.debug('Running session cleanup');
       this.claudeHandler.cleanupInactiveSessions();
     }, 5 * 60 * 1000); // Every 5 minutes
+
+    // Sweep abandoned approval cards from previous bot lifetimes. Fire-and-
+    // forget so we don't block setup; catch logs the result.
+    void this.sweepOrphanApprovalCards();
+  }
+
+  // If the bot crashed (or got SIGKILL'd) between posting an approval card and
+  // updating it with the final decision, the card sits there with live ✅/❌
+  // buttons forever. On startup we look for `.request.json` files older than
+  // the MCP's 5-min timeout (plus a 2-min grace) and rewrite the corresponding
+  // Slack message to "expired" so users aren't staring at a dead card.
+  private async sweepOrphanApprovalCards(): Promise<void> {
+    const STALE_MS = 7 * 60 * 1000;
+    let orphans;
+    try {
+      orphans = listOrphanRequests(STALE_MS);
+    } catch (err: any) {
+      this.logger.warn('Orphan sweep: failed to list', { error: err?.message });
+      return;
+    }
+    if (orphans.length === 0) {
+      this.logger.debug('Orphan sweep: nothing to do');
+      return;
+    }
+    this.logger.info('Orphan sweep: marking abandoned cards expired', { count: orphans.length });
+    for (const o of orphans) {
+      if (o.channel && o.ts) {
+        try {
+          await this.app.client.chat.update({
+            channel: o.channel,
+            ts: o.ts,
+            text: 'Permission request expired',
+            blocks: [
+              {
+                type: 'section',
+                text: {
+                  type: 'mrkdwn',
+                  text: `⏱️ *Permission Request — Expired*\n\nThe bot was offline when this card was awaiting your click. Ask Claude again if you still want \`${o.tool_name || 'this tool'}\` to run.`,
+                },
+              },
+            ],
+          });
+          this.logger.info('Orphan sweep: card expired', { approvalId: o.approvalId });
+        } catch (err: any) {
+          // Card may have been deleted, channel archived, etc. — log and
+          // proceed; we still want to remove the stale request file.
+          this.logger.warn('Orphan sweep: failed to update card', {
+            approvalId: o.approvalId, error: err?.message,
+          });
+        }
+      }
+      try { fs.unlinkSync(o.filePath); } catch { /* best-effort */ }
+    }
   }
 }
