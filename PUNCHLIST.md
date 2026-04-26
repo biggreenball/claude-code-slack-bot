@@ -16,7 +16,7 @@ Small fixes and known issues. Markers: 🔴 urgent / 🟡 important / 🟢 nice-
 
 - 🔴 **HMAC alone is defense-in-depth, not a real boundary.** A prompt-injected Claude tool running as the same user (root) can read `APPROVAL_HMAC_SECRET` from `/proc/<bot-pid>/environ` and forge approvals. Real fix requires out-of-band confirmation (TOTP, second-device reaction, external webhook, or running Claude tools under a non-root user). Schedule before financial data lands in scope per `project_saas_claude_bot.md`.
 - 🔴 **The PR-C Bash denylist is bypassable.** `bash -c "$(echo cGtpbGwgdHN4 | base64 -d)"`, `eval`, or write-script-then-execute will all slip past the regex. The denylist raises the bar against casual prompt injection but is not a sandbox. Same architectural fix as the HMAC item — non-root tool execution.
-- 🟡 **Thread auto-approval (`approve_thread_always` button) widens blast radius.** Once enabled, every subsequent gated tool in that thread runs without a card. A prompt-injected Claude session in an auto-approved thread can chain destructive ops with no human-in-the-loop. The PR-C Bash denylist still fires (good), but anything not in the denylist (Edit/Write of arbitrary paths, etc.) goes through. Consider auto-expiring auto-approval after N tools or M minutes.
+- 🟡 **Thread auto-approval still has no time/count expiry.** PR-C/r2 narrowed the scope (Write/Edit/NotebookEdit/Task always card even when opted in), but Bash auto-approves indefinitely subject to denylist. Consider TTL (1h) or use-count cap (10 calls) on top.
 - 🟡 **`mcp__postgres__query` is auto-approved** — fine while no sensitive data lives in Postgres, but the moment financials land per `project_saas_claude_bot.md`, this needs to revert to gated.
 
 ### Dead code / cleanup
@@ -27,6 +27,17 @@ Small fixes and known issues. Markers: 🔴 urgent / 🟡 important / 🟢 nice-
 - 🟢 Bare `catch { /* no-op */ }` in `index.ts` global middleware — log it instead.
 - 🟢 Stale `.tmp` cleanup on MCP startup (orphaned writes from crashes).
 - 🟢 Stale `approval_*.json` >5min old cleanup on MCP startup.
+
+### Deferred from PR-C review (small follow-ups)
+
+- 🟢 Unit tests for `DENIED_BASH_PATTERNS` and `DENIED_FILE_WRITE_PREFIXES` — even a smoke test catches regex regressions.
+- 🟢 Document StartLimitBurst recovery path in deploy/README (`systemctl reset-failed`).
+- 🟢 Rollback runbook should diff `package.json` and prompt `npm install` if deps changed.
+- 🟢 Replace `set -a; source .env; curl -H "Bearer $TOKEN"` sanity-check with a no-shell-history variant (e.g., `curl --oauth2-bearer @/dev/stdin <<< "$(grep ^SLACK_BOT_TOKEN= .env | cut -d= -f2)"`).
+- 🟢 `journalctl --rotate` before `--vacuum-time=1s` so in-memory entries also flush.
+- 🟢 systemd unit: add `WatchdogSec=` and `LogRateLimitIntervalSec=` for passive health + log-spam guard.
+- 🟢 Reconcile `OOMScoreAdjust=-1000` vs `MemoryMax=2G` — currently both, pick the rationale and document.
+- 🟢 Resolve `kill -9999` regex edge case (matches but is harmless syntax).
 
 ### Other
 
@@ -63,4 +74,10 @@ Small fixes and known issues. Markers: 🔴 urgent / 🟡 important / 🟢 nice-
 - ✅ [PR-C] systemd hardening: `StartLimitBurst=5` / `IntervalSec=60` (no restart-loop CPU burn), `OOMScoreAdjust=-1000`, `TasksMax=512`, `LimitNOFILE=8192`
 - ✅ [PR-C] Bash denylist in permission-prompt MCP: hard-deny `pkill`/`killall`/`kill <pid>`/`systemctl <action> claude-slack-bridge`/`shutdown`/`halt`/`reboot`/`init 0`/`rm` against state or install dirs. Pre-empts thread auto-approval — even an opted-in thread can't push a self-kill through.
 - ✅ [PR-C] Expanded `deploy/README.md` with first-time install, rollback, token rotation (Slack + HMAC), debugging stuck approvals, sanity checks
+- ✅ [PR-C/r2] Fix HMAC rotation runbook footgun (missing `;` made `sed` run with empty `$NEWHMAC`, would wipe the secret)
+- ✅ [PR-C/r2] Extend Bash denylist with `eval`, `base64 -d/-D/--decode`, and interpreter-`-c`/`-e`-with-kill/exec patterns; cap input length at 8KB to bound regex work
+- ✅ [PR-C/r2] Single permissive systemctl regex (handles flags between verb and service name); dropped redundant duplicate
+- ✅ [PR-C/r2] Pre-screen `Write`/`Edit`/`NotebookEdit` against `/etc/systemd/system/claude-slack-bridge.service`, `/opt/claude-slack-bridge/`, `/var/lib/claude-slack-bridge/` (no overwrite of bot install/state/unit)
+- ✅ [PR-C/r2] Length-validate `APPROVAL_HMAC_SECRET >= 32 chars` in `preflightMcpSpawnPaths` (loud boot-time fail instead of cryptic 5-min approval timeout)
+- ✅ [PR-C/r2] Tighten thread auto-approval: `Write`/`Edit`/`NotebookEdit`/`Task` always show approval card even in opted-in threads (Bash auto-approves under denylist)
 - :white_check_mark: first end-to-end Slack approval test

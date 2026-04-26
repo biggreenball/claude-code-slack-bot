@@ -93,7 +93,10 @@ In-flight approvals are invalidated when this rotates — that's the desired beh
 
 ```bash
 # Generate + replace in one shot. Value never echoed to terminal history.
-NEWHMAC=$(openssl rand -hex 32) sed -i "s|^APPROVAL_HMAC_SECRET=.*|APPROVAL_HMAC_SECRET=$NEWHMAC|" /opt/claude-slack-bridge/.env
+# The semicolon matters — without it, `NEWHMAC=...` becomes a one-shot env var
+# scoped to the sed invocation only, AND the shell expands $NEWHMAC BEFORE
+# setting it, so sed runs with empty $NEWHMAC and wipes the secret.
+NEWHMAC=$(openssl rand -hex 32); sed -i "s|^APPROVAL_HMAC_SECRET=.*|APPROVAL_HMAC_SECRET=$NEWHMAC|" /opt/claude-slack-bridge/.env
 unset NEWHMAC
 chmod 600 /opt/claude-slack-bridge/.env
 systemctl restart claude-slack-bridge
