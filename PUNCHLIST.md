@@ -80,4 +80,7 @@ Small fixes and known issues. Markers: 🔴 urgent / 🟡 important / 🟢 nice-
 - ✅ [PR-C/r2] Pre-screen `Write`/`Edit`/`NotebookEdit` against `/etc/systemd/system/claude-slack-bridge.service`, `/opt/claude-slack-bridge/`, `/var/lib/claude-slack-bridge/` (no overwrite of bot install/state/unit)
 - ✅ [PR-C/r2] Length-validate `APPROVAL_HMAC_SECRET >= 32 chars` in `preflightMcpSpawnPaths` (loud boot-time fail instead of cryptic 5-min approval timeout)
 - ✅ [PR-C/r2] Tighten thread auto-approval: `Write`/`Edit`/`NotebookEdit`/`Task` always show approval card even in opted-in threads (Bash auto-approves under denylist)
+- ✅ [PR-C/r3] Fix interpreter regex (`\b-[ce]\b` never fired because dash is non-word; switched to `\s-[ce](?=[\s'"])` lookbehind/lookahead form)
+- ✅ [PR-C/r3] Resolve relative paths via `path.resolve()` before path-prefix screen — `./.env` no longer slips past the absolute-path startsWith check
+- ✅ [PR-C/r3] Add `MultiEdit` to both path-screening and thread-auto-approval-exclusion lists (was overlooked in r2; uses `file_path` like Edit)
 - :white_check_mark: first end-to-end Slack approval test

@@ -116,7 +116,10 @@ const DENIED_BASH_PATTERNS: Array<{ re: RegExp; reason: string }> = [
   //     bypass attempts to "Claude has to be deliberately sneaky." ---
   { re: /\beval\b/i, reason: 'eval (indirect execution)' },
   { re: /\bbase64\s+(-d|-D|--decode|-i)\b/i, reason: 'base64 -d (decode-then-execute pattern)' },
-  { re: /\b(python3?|node|perl|ruby)\b[^\n]*\b-[ce]\b[^\n]*\b(kill|exec|os\.kill|process\.kill|spawn|system)\b/i, reason: 'interpreter -c/-e invoking kill/exec/spawn' },
+  // The `\b-[ce]\b` form does NOT match in practice because `-` is a non-word
+  // char and `\b` requires a word/non-word transition; `-c ` has only non-word
+  // chars on both sides of the `-`. Use whitespace-or-quote anchors instead.
+  { re: /\b(python3?|node|perl|ruby)\b[^\n]*\s-[ce](?=[\s'"])[^\n]*\b(kill|exec|os\.kill|process\.kill|spawn|system)\b/i, reason: 'interpreter -c/-e invoking kill/exec/spawn' },
 ];
 
 // Tool-call paths under any of these prefixes are off-limits for Write/Edit
@@ -132,7 +135,13 @@ const DENIED_FILE_WRITE_PREFIXES: ReadonlyArray<string> = [
 // "Always approve for thread," these keep showing approval cards because the
 // blast radius of a single auto-execution is too high for a bulk opt-in.
 const THREAD_AUTO_APPROVAL_EXCLUDES = new Set([
-  'Write', 'Edit', 'NotebookEdit', 'Task',
+  'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Task',
+]);
+
+// Tools whose input has a file_path (or notebook_path) that we screen against
+// DENIED_FILE_WRITE_PREFIXES.
+const PATH_SCREENED_TOOLS = new Set([
+  'Write', 'Edit', 'MultiEdit', 'NotebookEdit',
 ]);
 
 function screenForDangerousCommand(toolName: string, input: any): string | null {
@@ -148,11 +157,16 @@ function screenForDangerousCommand(toolName: string, input: any): string | null 
     return null;
   }
 
-  if (toolName === 'Write' || toolName === 'Edit' || toolName === 'NotebookEdit') {
-    const filePath: unknown = input?.file_path ?? input?.notebook_path;
-    if (typeof filePath !== 'string' || !filePath) return null;
+  if (PATH_SCREENED_TOOLS.has(toolName)) {
+    const rawPath: unknown = input?.file_path ?? input?.notebook_path;
+    if (typeof rawPath !== 'string' || !rawPath) return null;
+    // Resolve relative paths so `./.env` from a Claude session whose cwd is
+    // the bot's install dir doesn't slip past `startsWith('/opt/...')`.
+    // path.resolve uses process.cwd() which is the bot's WorkingDirectory
+    // (/opt/claude-slack-bridge per the systemd unit).
+    const resolved = path.resolve(rawPath);
     for (const prefix of DENIED_FILE_WRITE_PREFIXES) {
-      if (filePath === prefix || filePath.startsWith(prefix)) {
+      if (resolved === prefix || resolved.startsWith(prefix)) {
         return `${toolName} into ${prefix}* (would corrupt bot install / state / unit file)`;
       }
     }
