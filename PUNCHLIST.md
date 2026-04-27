@@ -83,4 +83,6 @@ Small fixes and known issues. Markers: 🔴 urgent / 🟡 important / 🟢 nice-
 - ✅ [PR-C/r3] Fix interpreter regex (`\b-[ce]\b` never fired because dash is non-word; switched to `\s-[ce](?=[\s'"])` lookbehind/lookahead form)
 - ✅ [PR-C/r3] Resolve relative paths via `path.resolve()` before path-prefix screen — `./.env` no longer slips past the absolute-path startsWith check
 - ✅ [PR-C/r3] Add `MultiEdit` to both path-screening and thread-auto-approval-exclusion lists (was overlooked in r2; uses `file_path` like Edit)
+- ✅ [PR-D] Persist sessions to `/var/lib/claude-slack-bridge/sessions/` (file-per-session JSON, atomic write-then-rename, mode 0600). Survives bot restart so Claude `--resume` keeps context across systemd reloads.
+- ✅ [PR-D] Backfill thread history when starting a fresh session in an existing Slack thread — pulls `conversations.replies`, filters bot UI messages, prepends as context to the prompt.
 - :white_check_mark: first end-to-end Slack approval test
