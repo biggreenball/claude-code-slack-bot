@@ -6,11 +6,7 @@ Small fixes and known issues. Markers: 🔴 urgent / 🟡 important / 🟢 nice-
 
 ### From PR-A review (PR-B + PR-C scope)
 
-- 🟡 [PR-B] `writeApprovalDecision` has zero error handling — disk-full / dir-deleted = silent wedge. Wrap in try-catch and surface error.
-- 🟡 [PR-B] Bot restart leaves orphan interactive approval cards in Slack. Sweep `/var/lib/claude-slack-bridge/approvals/` on startup and post "⏱️ timed out" updates to any cards whose decision file pre-dates this boot.
-- 🟡 [PR-B] Belt-and-suspenders redundancy — `slack-handler.ts` calls both `writeApprovalDecision()` and `permissionServer.resolveApproval()` (the latter calls the former). Pick one path.
 - 🟡 [PR-B] MCP subprocess startup failure surfaces as silent 5-min timeout. Detect spawn failure and surface immediately via Slack.
-- 🟡 [PR-B] Audit `journalctl -u claude-slack-bridge` for any leak of `SLACK_BOT_TOKEN` / `APPROVAL_HMAC_SECRET` from spawn-args or env-dump logging.
 
 ### True boundary follow-up
 
@@ -85,4 +81,7 @@ Small fixes and known issues. Markers: 🔴 urgent / 🟡 important / 🟢 nice-
 - ✅ [PR-C/r3] Add `MultiEdit` to both path-screening and thread-auto-approval-exclusion lists (was overlooked in r2; uses `file_path` like Edit)
 - ✅ [PR-D] Persist sessions to `/var/lib/claude-slack-bridge/sessions/` (file-per-session JSON, atomic write-then-rename, mode 0600). Survives bot restart so Claude `--resume` keeps context across systemd reloads.
 - ✅ [PR-D] Backfill thread history when starting a fresh session in an existing Slack thread — pulls `conversations.replies`, filters bot UI messages, prepends as context to the prompt.
-- :white_check_mark: first end-to-end Slack approval test
+- ✅ [PR-B] `writeApprovalDecision` zero-error-handling fixed (try-catch wrap, ephemeral failure surface) — duplicate of the existing PR-B done item; was lingering in Open by oversight.
+- ✅ [PR-B] Orphan approval cards on restart — `sweepOrphanApprovalCards()` + `listOrphanRequests()` shipped in PR-C; runs at startup with 7-min stale threshold, marks expired and unlinks request files.
+- ✅ [PR-B] Belt-and-suspenders redundancy resolved — duplicate of the existing PR-B done item; was lingering in Open by oversight.
+- ✅ [PR-B] Journal token-leak audit completed (PR #8) — found `Claude query options` debug log was still dumping `mcpServers[*].env` (SLACK_BOT_TOKEN + APPROVAL_HMAC_SECRET) into journal; sanitizeOptionsForLog() closes that source. Operator still needs to rotate tokens + vacuum journal because historical entries remain.
