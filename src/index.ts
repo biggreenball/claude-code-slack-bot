@@ -25,6 +25,16 @@ function preflightMcpSpawnPaths(): void {
       `Permission-prompt MCP cannot be spawned — missing required paths:\n  - ${missing.join('\n  - ')}\nStart the bot from /opt/claude-slack-bridge (or run \`npm install\` if tsx is missing).`,
     );
   }
+  // Validate APPROVAL_HMAC_SECRET length here at startup. validateConfig only
+  // checks presence; the MCP subprocess's getHmacSecret() throws at sign-time
+  // (i.e., when the user's first gated tool call happens), which surfaces as
+  // a confusing 5-min approval timeout. Catching it at boot is loud + correct.
+  const secret = process.env.APPROVAL_HMAC_SECRET || '';
+  if (secret.length < 32) {
+    throw new Error(
+      `APPROVAL_HMAC_SECRET must be >= 32 chars (current length: ${secret.length}). Generate with \`openssl rand -hex 32\` and replace the value in /opt/claude-slack-bridge/.env.`,
+    );
+  }
 }
 
 async function start() {

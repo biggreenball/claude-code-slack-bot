@@ -87,6 +87,95 @@ function assertValidApprovalId(approvalId: string): void {
   }
 }
 
+// Hard-deny patterns. Returns reason string if the request would terminate or
+// destroy the bot's own runtime, otherwise null. Checked BEFORE thread
+// auto-approval and BEFORE posting an approval card — even an auto-approved
+// thread can't push a self-kill through. Bypassable via sufficiently creative
+// shell tricks (write-then-run scripts, indirect via env vars, polyglot
+// payloads). This raises the bar against casual prompt injection but is NOT
+// a true sandbox — the real fix is non-root tool exec (see PUNCHLIST).
+// Conservative bias: false-deny is recoverable (SSH in); false-allow takes
+// the bot offline. Cap input length to bound regex work.
+const MAX_SCREENED_CMD_LEN = 8192;
+
+const DENIED_BASH_PATTERNS: Array<{ re: RegExp; reason: string }> = [
+  // --- direct signal/process kill ---
+  { re: /\bpkill\b/i, reason: 'pkill (bot may be the target)' },
+  { re: /\bkillall\b/i, reason: 'killall (bot may be the target)' },
+  { re: /\bkill\s+(-\w+\s+)?-?\d+/i, reason: 'kill <pid> (bot pid may be the target)' },
+  // Single permissive pattern: `systemctl ... <verb> ... claude-slack-bridge` with any flags between.
+  { re: /\bsystemctl\b.*\b(stop|disable|mask|kill|restart|reload)\b.*\bclaude-slack-bridge\b/i, reason: 'systemctl <stop|disable|mask|kill|restart|reload> claude-slack-bridge' },
+  { re: /\b(shutdown|halt|poweroff|reboot)\b/i, reason: 'shutdown/halt/poweroff/reboot' },
+  { re: /\binit\s+0\b/i, reason: 'init 0' },
+  // --- destroy state / install ---
+  { re: /\brm\s+(-[rRf]+\s+)*[^\s]*\/var\/lib\/claude-slack-bridge/i, reason: 'rm /var/lib/claude-slack-bridge (state dir)' },
+  { re: /\brm\s+(-[rRf]+\s+)*[^\s]*\/opt\/claude-slack-bridge/i, reason: 'rm /opt/claude-slack-bridge (install dir)' },
+  { re: /\brm\s+(-[rRf]+\s+)*\/(\s|$)/, reason: 'rm /' },
+  // --- common indirection patterns. Not exhaustive (write-script-then-run
+  //     and polyglot payloads still slip past); escalates the cost of casual
+  //     bypass attempts to "Claude has to be deliberately sneaky." ---
+  { re: /\beval\b/i, reason: 'eval (indirect execution)' },
+  { re: /\bbase64\s+(-d|-D|--decode|-i)\b/i, reason: 'base64 -d (decode-then-execute pattern)' },
+  // The `\b-[ce]\b` form does NOT match in practice because `-` is a non-word
+  // char and `\b` requires a word/non-word transition; `-c ` has only non-word
+  // chars on both sides of the `-`. Use whitespace-or-quote anchors instead.
+  { re: /\b(python3?|node|perl|ruby)\b[^\n]*\s-[ce](?=[\s'"])[^\n]*\b(kill|exec|os\.kill|process\.kill|spawn|system)\b/i, reason: 'interpreter -c/-e invoking kill/exec/spawn' },
+];
+
+// Tool-call paths under any of these prefixes are off-limits for Write/Edit
+// because overwriting them would either kill the bot, corrupt approval
+// state, or forge approvals.
+const DENIED_FILE_WRITE_PREFIXES: ReadonlyArray<string> = [
+  '/etc/systemd/system/claude-slack-bridge.service',
+  '/opt/claude-slack-bridge/',
+  '/var/lib/claude-slack-bridge/',
+];
+
+// Tools excluded from thread auto-approval. Even when the user has opted into
+// "Always approve for thread," these keep showing approval cards because the
+// blast radius of a single auto-execution is too high for a bulk opt-in.
+const THREAD_AUTO_APPROVAL_EXCLUDES = new Set([
+  'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Task',
+]);
+
+// Tools whose input has a file_path (or notebook_path) that we screen against
+// DENIED_FILE_WRITE_PREFIXES.
+const PATH_SCREENED_TOOLS = new Set([
+  'Write', 'Edit', 'MultiEdit', 'NotebookEdit',
+]);
+
+function screenForDangerousCommand(toolName: string, input: any): string | null {
+  if (toolName === 'Bash') {
+    const cmd: unknown = input?.command;
+    if (typeof cmd !== 'string' || !cmd) return null;
+    if (cmd.length > MAX_SCREENED_CMD_LEN) {
+      return `Bash command exceeds ${MAX_SCREENED_CMD_LEN} chars (refusing to screen, denying for safety)`;
+    }
+    for (const { re, reason } of DENIED_BASH_PATTERNS) {
+      if (re.test(cmd)) return reason;
+    }
+    return null;
+  }
+
+  if (PATH_SCREENED_TOOLS.has(toolName)) {
+    const rawPath: unknown = input?.file_path ?? input?.notebook_path;
+    if (typeof rawPath !== 'string' || !rawPath) return null;
+    // Resolve relative paths so `./.env` from a Claude session whose cwd is
+    // the bot's install dir doesn't slip past `startsWith('/opt/...')`.
+    // path.resolve uses process.cwd() which is the bot's WorkingDirectory
+    // (/opt/claude-slack-bridge per the systemd unit).
+    const resolved = path.resolve(rawPath);
+    for (const prefix of DENIED_FILE_WRITE_PREFIXES) {
+      if (resolved === prefix || resolved.startsWith(prefix)) {
+        return `${toolName} into ${prefix}* (would corrupt bot install / state / unit file)`;
+      }
+    }
+    return null;
+  }
+
+  return null;
+}
+
 class PermissionMCPServer {
   private server: Server;
   private slack: WebClient;
@@ -162,8 +251,31 @@ class PermissionMCPServer {
     const slackContext = slackContextStr ? JSON.parse(slackContextStr) : {};
     const { channel, threadTs: thread_ts, user, threadAutoApproved } = slackContext;
 
-    // If thread has auto-approval enabled for this user, approve immediately
-    if (threadAutoApproved) {
+    // Hard-deny self-kill / self-destroy commands BEFORE auto-approval kicks in.
+    // Even a thread the user opted into auto-approve can't push these through.
+    const denyReason = screenForDangerousCommand(tool_name, input);
+    if (denyReason) {
+      logger.warn('Hard-denied dangerous command', { tool_name, reason: denyReason, user });
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify({
+              behavior: 'deny',
+              message: `Auto-denied — command matches a self-kill / self-destroy pattern (${denyReason}). If this was intentional, SSH directly to the host instead.`,
+            }),
+          },
+        ],
+      };
+    }
+
+    // If thread has auto-approval enabled for this user, approve — but ONLY
+    // for tools that aren't write/exec on disk. Write/Edit/NotebookEdit/Task
+    // always show a card even in opted-in threads, so a single click in a
+    // prompt-injected thread can't auto-execute arbitrary file mutations or
+    // sub-agent spawns. Bash auto-approves under the denylist (already
+    // screened above for self-kill / -destroy patterns).
+    if (threadAutoApproved && !THREAD_AUTO_APPROVAL_EXCLUDES.has(tool_name)) {
       logger.info('Auto-approving tool for thread', { tool_name, user, thread_ts });
       return {
         behavior: 'allow' as const,
