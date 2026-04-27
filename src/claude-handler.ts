@@ -4,6 +4,28 @@ import { Logger } from './logger';
 import { McpManager, McpServerConfig } from './mcp-manager';
 import { loadAllSessions, saveSession, deleteSession } from './session-store';
 
+// Strip secret-bearing fields from a Claude SDK options object so we can
+// safely emit it at debug level. Currently mcpServers[*].env carries
+// SLACK_BOT_TOKEN and APPROVAL_HMAC_SECRET — both of which leaked into the
+// systemd journal via the `Claude query options` debug log before this
+// helper existed (the previous BOT_DEBUG rename closed the SDK's spawn-args
+// log but not our own).
+function sanitizeOptionsForLog(opts: Record<string, any>): Record<string, any> {
+  const clone: Record<string, any> = { ...opts };
+  if (clone.mcpServers && typeof clone.mcpServers === 'object') {
+    const sanitizedServers: Record<string, any> = {};
+    for (const [name, cfg] of Object.entries(clone.mcpServers)) {
+      const c = cfg as Record<string, any>;
+      sanitizedServers[name] = c?.env
+        ? { ...c, env: '[redacted: keys=' + Object.keys(c.env).join(',') + ']' }
+        : c;
+    }
+    clone.mcpServers = sanitizedServers;
+  }
+  if (clone.abortController) clone.abortController = '[AbortController]';
+  return clone;
+}
+
 export class ClaudeHandler {
   private sessions: Map<string, ConversationSession>;
   private logger = new Logger('ClaudeHandler');
@@ -177,7 +199,7 @@ export class ClaudeHandler {
 
     options.abortController = abortController || new AbortController();
 
-    this.logger.debug('Claude query options', options);
+    this.logger.debug('Claude query options', sanitizeOptionsForLog(options));
 
     try {
       for await (const message of query({
