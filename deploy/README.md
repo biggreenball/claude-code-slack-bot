@@ -66,6 +66,40 @@ systemctl stop claude-slack-bridge           # one-off stop
 systemctl disable --now claude-slack-bridge  # stop + don't start at boot
 ```
 
+## Manifest / scope updates
+
+When `slack-app-manifest.json` (or `.yaml`) changes — new scopes, new event subscriptions, etc. — a **workspace reinstall is required** to actually grant the new scopes on the bot token. Code-side changes alone do nothing; the OAuth grant is frozen at last install time.
+
+How to tell the live token is missing scopes the manifest declares:
+
+```bash
+set -a; source /opt/claude-slack-bridge/.env; set +a
+curl -sS -D - -H "Authorization: Bearer $SLACK_BOT_TOKEN" https://slack.com/api/auth.test -o /dev/null \
+  | grep -i '^x-oauth-scopes:'
+# compare against the manifest's bot scopes — any in the manifest but not in the response = needs reinstall
+```
+
+To apply a manifest change:
+
+1. Merge the manifest change to `main` and pull on TRC1 (`cd /opt/claude-slack-bridge && git pull`).
+2. Go to <https://api.slack.com/apps> → your "Claude Code Bot" app → **App Manifest**.
+3. Paste the contents of `slack-app-manifest.json` (or YAML), save. Slack will surface a diff and prompt for reinstall if scopes/events changed.
+4. Click **Install to Workspace** (or "Reinstall to Workspace") on the OAuth confirmation screen and approve the new scopes.
+5. Slack issues a fresh bot token. Copy the new `xoxb-...` and update `.env`:
+   ```bash
+   sed -i 's|^SLACK_BOT_TOKEN=.*|SLACK_BOT_TOKEN=xoxb-paste-here|' /opt/claude-slack-bridge/.env
+   chmod 600 /opt/claude-slack-bridge/.env
+   systemctl restart claude-slack-bridge
+   ```
+6. Verify the new scopes are live:
+   ```bash
+   set -a; source /opt/claude-slack-bridge/.env; set +a
+   curl -sS -D - -H "Authorization: Bearer $SLACK_BOT_TOKEN" https://slack.com/api/auth.test -o /dev/null \
+     | grep -i '^x-oauth-scopes:'
+   ```
+
+> **Heads up — silent scope removals.** Reinstall replaces the granted scope set with whatever the manifest declares. If a scope is in the live token but *not* in the manifest, it gets dropped. Diff the live `x-oauth-scopes` header against the manifest *before* reinstalling so you don't lose a scope something quietly depends on.
+
 ## Token rotation
 
 Rotate when a token has been logged, leaked, or just on a periodic cadence (recommended every 90 days for `SLACK_BOT_TOKEN`, on each suspected compromise for `APPROVAL_HMAC_SECRET`).
