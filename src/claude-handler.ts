@@ -2,14 +2,21 @@ import { query, type SDKMessage } from '@anthropic-ai/claude-code';
 import { ConversationSession } from './types';
 import { Logger } from './logger';
 import { McpManager, McpServerConfig } from './mcp-manager';
+import { loadAllSessions, saveSession, deleteSession } from './session-store';
 
 export class ClaudeHandler {
-  private sessions: Map<string, ConversationSession> = new Map();
+  private sessions: Map<string, ConversationSession>;
   private logger = new Logger('ClaudeHandler');
   private mcpManager: McpManager;
 
   constructor(mcpManager: McpManager) {
     this.mcpManager = mcpManager;
+    // Restore sessions from disk so a bot restart doesn't drop the user's
+    // in-flight Claude conversation. The SDK's `--resume <session_id>` then
+    // picks up server-side context (assuming the session is still alive on
+    // Anthropic's side; if not, the SDK errors and the next message starts
+    // fresh, which is the prior behavior).
+    this.sessions = loadAllSessions();
   }
 
   getSessionKey(userId: string, channelId: string, threadTs?: string): string {
@@ -28,7 +35,9 @@ export class ClaudeHandler {
       isActive: true,
       lastActivity: new Date(),
     };
-    this.sessions.set(this.getSessionKey(userId, channelId, threadTs), session);
+    const key = this.getSessionKey(userId, channelId, threadTs);
+    this.sessions.set(key, session);
+    saveSession(key, session);
     return session;
   }
 
@@ -178,7 +187,13 @@ export class ClaudeHandler {
         if (message.type === 'system' && message.subtype === 'init') {
           if (session) {
             session.sessionId = message.session_id;
-            this.logger.info('Session initialized', { 
+            session.lastActivity = new Date();
+            // Persist the freshly-assigned session_id so a restart can resume.
+            saveSession(
+              this.getSessionKey(session.userId, session.channelId, session.threadTs),
+              session,
+            );
+            this.logger.info('Session initialized', {
               sessionId: message.session_id,
               model: (message as any).model,
               tools: (message as any).tools?.length || 0,
@@ -199,6 +214,7 @@ export class ClaudeHandler {
     for (const [key, session] of this.sessions.entries()) {
       if (now - session.lastActivity.getTime() > maxAge) {
         this.sessions.delete(key);
+        deleteSession(key);
         cleaned++;
       }
     }

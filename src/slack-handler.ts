@@ -321,6 +321,7 @@ export class SlackHandler {
     this.activeControllers.set(sessionKey, abortController);
 
     let session = this.claudeHandler.getSession(user, channel, thread_ts || ts);
+    const isColdStart = !session;
     if (!session) {
       this.logger.debug('Creating new session', { sessionKey });
       session = this.claudeHandler.createSession(user, channel, thread_ts || ts);
@@ -328,14 +329,29 @@ export class SlackHandler {
       this.logger.debug('Using existing session', { sessionKey, sessionId: session.sessionId });
     }
 
+    // Cold-start backfill: if this is a fresh session BUT there's already a
+    // thread with prior messages, pull the thread history via Slack API and
+    // prepend it as context. Otherwise the bot has no idea what was said
+    // before — particularly painful after restarts (Claude session_id may
+    // be lost) and when a user @-mentions the bot in an existing thread.
+    let backfillContext = '';
+    if (isColdStart && thread_ts) {
+      backfillContext = await this.fetchThreadBackfill(channel, thread_ts, ts);
+    }
+
     let currentMessages: string[] = [];
     let statusMessageTs: string | undefined;
 
     try {
       // Prepare the prompt with file attachments
-      const finalPrompt = processedFiles.length > 0 
+      let finalPrompt = processedFiles.length > 0
         ? await this.fileHandler.formatFilePrompt(processedFiles, text || '')
         : text || '';
+
+      if (backfillContext) {
+        finalPrompt =
+          `[Previous conversation in this Slack thread, for context — do not respond to these older messages directly]\n${backfillContext}\n[End previous conversation]\n\n[New message from <@${user}>]\n${finalPrompt}`;
+      }
 
       this.logger.info('Sending query to Claude Code SDK', { 
         prompt: finalPrompt.substring(0, 200) + (finalPrompt.length > 200 ? '...' : ''), 
@@ -777,6 +793,57 @@ export class SlackHandler {
       }
     }
     return this.botUserId;
+  }
+
+  // Pull the thread's message history via conversations.replies and format it
+  // as plaintext context to prepend to a fresh-session prompt. Best-effort:
+  // if Slack errors out, we just return '' and Claude starts cold.
+  private async fetchThreadBackfill(
+    channel: string,
+    threadTs: string,
+    currentTs: string,
+  ): Promise<string> {
+    try {
+      const result = await this.app.client.conversations.replies({
+        channel,
+        ts: threadTs,
+        limit: 50,
+      });
+      const msgs = result.messages || [];
+      const lines: string[] = [];
+      for (const m of msgs) {
+        // Skip the message that triggered THIS handleMessage (we'll add it
+        // separately as the "new message").
+        if (m.ts === currentTs) continue;
+        // Skip our own approval cards / status messages — they're UI noise
+        // and re-feeding them back to Claude doesn't help context.
+        if (this.looksLikeBotUiMessage(m)) continue;
+        const text = (m as any).text || '';
+        if (!text.trim()) continue;
+        const author = (m as any).bot_id ? 'bot' : (`<@${(m as any).user || 'unknown'}>`);
+        lines.push(`${author}: ${text}`);
+      }
+      const joined = lines.join('\n');
+      if (joined) {
+        this.logger.info('Backfilled thread history into prompt', {
+          channel, threadTs, lineCount: lines.length, charCount: joined.length,
+        });
+      }
+      return joined;
+    } catch (err: any) {
+      this.logger.warn('Thread backfill failed', { channel, threadTs, error: err?.message });
+      return '';
+    }
+  }
+
+  private looksLikeBotUiMessage(m: any): boolean {
+    if (!m.bot_id) return false;
+    const text = typeof m.text === 'string' ? m.text : '';
+    if (text.startsWith('Permission request for ')) return true;     // approval cards
+    if (text.startsWith('🤔 ') || text.includes('*Thinking...*')) return true;  // status
+    if (text.startsWith('⏱️ ') && text.includes('Expired')) return true;       // orphan-sweep
+    if (text.startsWith('✅ *Task completed*')) return true;                    // status
+    return false;
   }
 
   private getThreadKey(channelId: string, threadTs?: string): string {
