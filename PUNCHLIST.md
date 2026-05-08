@@ -60,9 +60,9 @@ Small fixes and known issues. Markers: 🔴 urgent / 🟡 important / 🟢 nice-
 - ✅ [PR-A] Validate approvalId regex on read + write paths (path injection guard)
 - ✅ [PR-A] Approvals dir mode 0700 + decision files mode 0600
 - ✅ [PR-A] Move APPROVALS_DIR `/tmp/` → `/var/lib/claude-slack-bridge/approvals/` (survives reboot via systemd `StateDirectory=`)
-- ✅ Thread replies without mentions work when bot active in thread
+- ✅ Thread replies without mentions work when bot active in thread — fixed 2026-05-08: (1) `app.message()` had no DM filter causing double-processing; restricted to DMs only. (2) `message.channels` and `message.groups` event subscriptions were missing from the Slack app's Event Subscriptions config — Slack was never delivering channel message events to the bot. Added both via api.slack.com and reinstalled the app.
 - ✅ Read-only MCP tools (GitHub, Git, filesystem, postgres, web-search) bypass approval prompts
-- ✅ "Always approve for thread" button enables auto-approval for specific threads
+- ✅ "Always approve for thread" button enables auto-approval for specific threads — fixed 2026-05-08: auto-approval fast-path was missing the `content:[{type:"text",text:...}]` wrapper required by Claude Code SDK, causing "Permission prompt tool returned an invalid result" across all sessions.
 - ✅ Enhanced Slack Block Kit formatting with rich text blocks for better message rendering
 - ✅ [PR-B] writeApprovalDecision wrapped in try-catch; failures surface ephemerally instead of silent wedge
 - ✅ [PR-B] Drop redundant `permissionServer.resolveApproval()` call in slack-handler; deleted dead method on PermissionMCPServer; deleted dead `pendingApprovals` Map field

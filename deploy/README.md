@@ -1,4 +1,52 @@
-# Deployment
+# Claude Code Slack Bot — Setup & Operations
+
+## Slack App Setup (one-time)
+
+### 1. Create the app at api.slack.com
+
+1. Go to <https://api.slack.com/apps> → **Create New App** → **From scratch**.
+2. Name it (e.g. "Claude Code Bot"), pick your workspace.
+
+### 2. Enable Socket Mode
+
+**Settings → Socket Mode** → toggle on → generate an App-Level Token with `connections:write` scope → copy the `xapp-...` token.
+
+### 3. Enable Interactivity
+
+**Features → Interactivity & Shortcuts** → toggle on. No URL needed (Socket Mode).
+
+### 4. Subscribe to bot events
+
+**Features → Event Subscriptions** → toggle on → **Subscribe to bot events** → add all four:
+
+| Event | Purpose |
+|---|---|
+| `app_mention` | Respond when @mentioned |
+| `message.channels` | Receive replies in public channels (required for thread replies without @mention) |
+| `message.groups` | Same for private channels |
+| `message.im` | Direct messages |
+
+> **`message.channels` and `message.groups` are the most commonly missed.** Without them, the bot only responds to @mentions — thread replies without a mention are silently ignored.
+
+Save changes. Slack will ask you to reinstall — do it.
+
+### 5. Set OAuth scopes
+
+**Features → OAuth & Permissions → Scopes → Bot Token Scopes** — add:
+
+`app_mentions:read`, `channels:history`, `channels:read`, `chat:write`, `chat:write.public`, `files:read`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`, `reactions:read`, `reactions:write`, `users:read`
+
+Reinstall the app to the workspace if prompted.
+
+### 6. Copy your tokens
+
+| Token | Where to find it |
+|---|---|
+| `SLACK_BOT_TOKEN` (`xoxb-...`) | OAuth & Permissions → OAuth Tokens |
+| `SLACK_APP_TOKEN` (`xapp-...`) | Basic Information → App-Level Tokens |
+| `SLACK_SIGNING_SECRET` | Basic Information → Signing Secret |
+
+---
 
 ## First-time install (systemd)
 
@@ -65,6 +113,50 @@ systemctl restart claude-slack-bridge
 systemctl stop claude-slack-bridge           # one-off stop
 systemctl disable --now claude-slack-bridge  # stop + don't start at boot
 ```
+
+## Using the bot
+
+### Set a working directory
+
+The bot requires a working directory before it will run commands. Set one per-channel or per-thread:
+
+```
+cwd /opt/my-project          # absolute path
+cwd my-project               # relative to BASE_DIRECTORY (if set in .env)
+```
+
+Threads can override the channel default: mention the bot in a thread with `@bot cwd /other/path`.
+
+### Talk to the bot
+
+- **In a channel**: `@Claude Code Bot <your message>` — starts a thread.
+- **In a thread where the bot has been active**: just type — no @mention needed (requires `message.channels` event subscription).
+- **Direct message**: send a message directly to the bot (requires `ALLOW_DMS=true` is not currently enforced but DMs are off by default via `allowDms: false`).
+
+### Approval buttons
+
+Whenever Claude wants to run a mutating command (`Bash`, `Write`, `Edit`, etc.) a Slack card appears with three buttons:
+
+| Button | Effect |
+|---|---|
+| ✅ Approve | Run this one command |
+| ❌ Deny | Block this command |
+| 🔄 Always approve this command | Auto-approve this specific command family for the rest of the thread (e.g. approving `roadie-list add ...` auto-approves all future `roadie-list add` calls, but not `roadie-list read` or other tools) |
+
+Read-only tools (`Read`, `Glob`, `Grep`, `LS`, `WebSearch`, `WebFetch`, `NotebookRead`, `TodoWrite`) and read-only MCP tools (GitHub reads, git reads, postgres SELECT) are always auto-approved and never show a card.
+
+`Write`, `Edit`, `MultiEdit`, `NotebookEdit`, and `Task` always show a card even if you've used "Always approve" — the blast radius is too high for bulk opt-in.
+
+### Bot commands
+
+| Command | Effect |
+|---|---|
+| `cwd <path>` | Set working directory for channel or thread |
+| `@bot cwd <path>` | Set working directory for a specific thread |
+| `mcp` / `mcp info` | Show loaded MCP server config |
+| `mcp reload` | Reload MCP config from `mcp-servers.json` without restart |
+
+---
 
 ## Token rotation
 

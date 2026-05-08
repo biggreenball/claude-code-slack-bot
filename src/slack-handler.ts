@@ -31,7 +31,7 @@ export class SlackHandler {
   private app: App;
   private claudeHandler: ClaudeHandler;
   private activeControllers: Map<string, AbortController> = new Map();
-  private threadAutoApprovals = new Map<string, Set<string>>(); // threadKey -> userIds
+  private threadAutoApprovals = new Map<string, Map<string, Set<string>>>(); // threadKey -> userId -> Set<baseCommandPattern>
   private logger = new Logger('SlackHandler');
   private workingDirManager: WorkingDirectoryManager;
   private fileHandler: FileHandler;
@@ -134,21 +134,35 @@ export class SlackHandler {
       return;
     }
 
-    const approvalId = body?.actions?.[0]?.value;
-    if (typeof approvalId !== 'string' || !approvalId) {
+    // Button value encodes "approvalId|baseCommandPattern". Parse both.
+    const buttonValue = body?.actions?.[0]?.value;
+    if (typeof buttonValue !== 'string' || !buttonValue) {
+      this.logger.warn('Thread auto-approval click missing value', { user: userId });
+      await respond({ response_type: 'ephemeral', text: 'Click was malformed (no value).' });
+      return;
+    }
+    const pipeIdx = buttonValue.indexOf('|');
+    const approvalId = pipeIdx >= 0 ? buttonValue.substring(0, pipeIdx) : buttonValue;
+    const pattern = pipeIdx >= 0 ? buttonValue.substring(pipeIdx + 1) : null;
+
+    if (!approvalId) {
       this.logger.warn('Thread auto-approval click missing approvalId', { user: userId });
       await respond({ response_type: 'ephemeral', text: 'Click was malformed (no approval id).' });
       return;
     }
 
-    // Enable thread auto-approval for this user
-    this.setThreadAutoApproval(channelId, threadTs, userId);
+    // Register the approved pattern for this thread
+    if (pattern) {
+      this.setThreadAutoApproval(channelId, threadTs, userId, pattern);
+    } else {
+      this.logger.warn('Thread auto-approval click missing pattern (old button format?)', { user: userId, approvalId });
+    }
 
     // Also approve the current request
     try {
       writeApprovalDecision(approvalId, {
         behavior: 'allow',
-        message: 'Approved with thread auto-approval enabled',
+        message: `Approved with auto-approval pattern "${pattern}"`,
       });
     } catch (err: any) {
       this.logger.error('Failed to persist auto-approval decision', err);
@@ -160,9 +174,10 @@ export class SlackHandler {
     }
 
     const context = threadTs ? 'this thread' : 'this channel';
+    const patternLabel = pattern || 'this command';
     await respond({
       response_type: 'ephemeral',
-      text: `🔄 Thread auto-approval enabled for ${context}. Future tool requests will be approved automatically.`,
+      text: `🔄 \`${patternLabel}\` will be auto-approved for the rest of ${context}.`,
     });
   }
 
@@ -377,7 +392,7 @@ export class SlackHandler {
         channel,
         threadTs: thread_ts || ts,
         user,
-        threadAutoApproved: this.isThreadAutoApproved(channel, thread_ts, user)
+        threadAutoApprovedPatterns: this.getThreadAutoApprovedPatterns(channel, thread_ts, user),
       };
       
       for await (const message of this.claudeHandler.streamQuery(finalPrompt, session, abortController, workingDirectory, slackContext)) {
@@ -850,19 +865,23 @@ export class SlackHandler {
     return threadTs ? `${channelId}:${threadTs}` : channelId;
   }
 
-  private isThreadAutoApproved(channelId: string, threadTs: string | undefined, userId: string): boolean {
+  private getThreadAutoApprovedPatterns(channelId: string, threadTs: string | undefined, userId: string): string[] {
     const threadKey = this.getThreadKey(channelId, threadTs);
-    const approvedUsers = this.threadAutoApprovals.get(threadKey);
-    return approvedUsers?.has(userId) || false;
+    const userPatterns = this.threadAutoApprovals.get(threadKey)?.get(userId);
+    return userPatterns ? Array.from(userPatterns) : [];
   }
 
-  private setThreadAutoApproval(channelId: string, threadTs: string | undefined, userId: string): void {
+  private setThreadAutoApproval(channelId: string, threadTs: string | undefined, userId: string, pattern: string): void {
     const threadKey = this.getThreadKey(channelId, threadTs);
     if (!this.threadAutoApprovals.has(threadKey)) {
-      this.threadAutoApprovals.set(threadKey, new Set());
+      this.threadAutoApprovals.set(threadKey, new Map());
     }
-    this.threadAutoApprovals.get(threadKey)!.add(userId);
-    this.logger.info('Thread auto-approval enabled', { threadKey, userId });
+    const userMap = this.threadAutoApprovals.get(threadKey)!;
+    if (!userMap.has(userId)) {
+      userMap.set(userId, new Set());
+    }
+    userMap.get(userId)!.add(pattern);
+    this.logger.info('Thread auto-approval pattern added', { threadKey, userId, pattern });
   }
 
   private async handleChannelJoin(channelId: string, say: any): Promise<void> {
@@ -1199,13 +1218,17 @@ export class SlackHandler {
   }
 
   setupEventHandlers() {
-    // Handle direct messages
+    // Handle direct messages (DMs only — channel @mentions go through app_mention,
+    // thread replies without mention go through the message event handler below).
     this.app.message(async ({ message, say }) => {
       if (message.subtype === undefined && 'user' in message) {
         const user = (message as any).user;
         const channel = (message as any).channel;
+        // Skip channel messages here to avoid double-processing with app_mention
+        // and the thread-reply handler.
+        if (!channel.startsWith('D')) return;
         if (!this.isAllowed(user, channel)) {
-          this.logger.warn('Rejected message', { user, channel });
+          this.logger.warn('Rejected DM', { user, channel });
           return;
         }
         this.logger.info('Handling direct message event');
@@ -1227,34 +1250,40 @@ export class SlackHandler {
       } as MessageEvent, say);
     });
 
-    // Handle thread replies without mentions (if bot has active session)
+    // Handle thread replies without mentions and file uploads in channels.
     this.app.event('message', async ({ event, say }) => {
-      // Skip bot messages, messages with subtypes (except file_share), and messages without users
+      // Skip bot messages and messages without a user field
       if ('bot_id' in event || !('user' in event)) return;
 
       const user = (event as any).user;
       const channel = (event as any).channel;
       const thread_ts = (event as any).thread_ts;
+      const ts = (event as any).ts;
+
+      this.logger.debug('message event received', { user, channel, thread_ts, ts, subtype: (event as any).subtype });
 
       if (!this.isAllowed(user, channel)) {
+        this.logger.debug('message event: user/channel not allowed', { user, channel });
         return;
       }
 
-      // Handle file uploads (original logic)
-      if (event.subtype === 'file_share' && event.files) {
+      // File uploads
+      if (event.subtype === 'file_share' && (event as any).files) {
         this.logger.info('Handling file upload event');
         await this.handleMessage(event as MessageEvent, say);
         return;
       }
 
-      // Handle thread replies without mentions (only if no subtype and in a thread)
+      // Thread replies without mentions — respond if bot has been active in this thread.
+      // Use hasThreadSession (any user) rather than exact-user getSession so the bot
+      // responds even when the session was created by a different user or the exact
+      // key lookup would miss a slight variant.
       if (!event.subtype && thread_ts) {
-        // Check if bot has an active session for this thread
-        const sessionKey = this.claudeHandler.getSessionKey(user, channel, thread_ts);
-        const session = this.claudeHandler.getSession(user, channel, thread_ts);
-
-        if (session) {
-          this.logger.info('Handling thread reply without mention');
+        const exactSession = this.claudeHandler.getSession(user, channel, thread_ts);
+        const threadActive = exactSession || this.claudeHandler.hasThreadSession(channel, thread_ts);
+        this.logger.debug('thread reply check', { thread_ts, exactSession: !!exactSession, threadActive });
+        if (threadActive) {
+          this.logger.info('Handling thread reply without mention', { user, channel, thread_ts });
           await this.handleMessage(event as MessageEvent, say);
           return;
         }

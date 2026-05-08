@@ -131,12 +131,38 @@ const DENIED_FILE_WRITE_PREFIXES: ReadonlyArray<string> = [
   '/var/lib/claude-slack-bridge/',
 ];
 
-// Tools excluded from thread auto-approval. Even when the user has opted into
-// "Always approve for thread," these keep showing approval cards because the
-// blast radius of a single auto-execution is too high for a bulk opt-in.
+// Tools excluded from thread auto-approval. Even when the user has approved a
+// pattern for a thread, these always show a card because the blast radius of a
+// single auto-execution is too high (arbitrary file mutations, sub-agent spawns).
 const THREAD_AUTO_APPROVAL_EXCLUDES = new Set([
   'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Task',
 ]);
+
+// Extract the "base command pattern" for a tool call — used to scope "Always
+// approve for thread" to the specific command family the user approved, not
+// to all tools in the thread.
+//
+// For Bash: "executable subcommand" if the second token isn't a flag,
+//   otherwise just "executable". Examples:
+//     roadie-list add --title ...  →  "Bash:roadie-list add"
+//     npm install express          →  "Bash:npm install"
+//     git commit -m "..."          →  "Bash:git commit"
+//     ls -la                       →  "Bash:ls"
+// For other (non-excluded) tools: "ToolName:/path" so approvals are
+//   path-scoped rather than blanket.
+export function extractBaseCommandPattern(toolName: string, input: any): string {
+  if (toolName === 'Bash') {
+    const cmd = (typeof input?.command === 'string' ? input.command : '').trim();
+    const tokens = cmd.split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) return 'Bash:';
+    if (tokens.length >= 2 && !tokens[1].startsWith('-')) {
+      return `Bash:${tokens[0]} ${tokens[1]}`;
+    }
+    return `Bash:${tokens[0]}`;
+  }
+  const filePath = input?.file_path || input?.notebook_path || '';
+  return filePath ? `${toolName}:${filePath}` : toolName;
+}
 
 // Tools whose input has a file_path (or notebook_path) that we screen against
 // DENIED_FILE_WRITE_PREFIXES.
@@ -249,7 +275,7 @@ class PermissionMCPServer {
     // Get Slack context from environment (passed by Claude handler)
     const slackContextStr = process.env.SLACK_CONTEXT;
     const slackContext = slackContextStr ? JSON.parse(slackContextStr) : {};
-    const { channel, threadTs: thread_ts, user, threadAutoApproved } = slackContext;
+    const { channel, threadTs: thread_ts, user, threadAutoApprovedPatterns } = slackContext;
 
     // Hard-deny self-kill / self-destroy commands BEFORE auto-approval kicks in.
     // Even a thread the user opted into auto-approve can't push these through.
@@ -269,19 +295,31 @@ class PermissionMCPServer {
       };
     }
 
-    // If thread has auto-approval enabled for this user, approve — but ONLY
-    // for tools that aren't write/exec on disk. Write/Edit/NotebookEdit/Task
-    // always show a card even in opted-in threads, so a single click in a
-    // prompt-injected thread can't auto-execute arbitrary file mutations or
-    // sub-agent spawns. Bash auto-approves under the denylist (already
-    // screened above for self-kill / -destroy patterns).
-    if (threadAutoApproved && !THREAD_AUTO_APPROVAL_EXCLUDES.has(tool_name)) {
-      logger.info('Auto-approving tool for thread', { tool_name, user, thread_ts });
-      return {
-        behavior: 'allow' as const,
-        updatedInput: input,
-        message: 'Auto-approved for thread'
-      };
+    // If the current command matches a pattern the user previously approved for
+    // this thread, auto-approve it — but never for write/file-mutation tools.
+    // Pattern matching is scoped to executable+subcommand (e.g. "roadie-list add")
+    // so approving one roadie-list command doesn't blanket-approve all bash.
+    if (
+      Array.isArray(threadAutoApprovedPatterns) &&
+      threadAutoApprovedPatterns.length > 0 &&
+      !THREAD_AUTO_APPROVAL_EXCLUDES.has(tool_name)
+    ) {
+      const currentPattern = extractBaseCommandPattern(tool_name, input);
+      if (threadAutoApprovedPatterns.includes(currentPattern)) {
+        logger.info('Auto-approving tool for thread (pattern match)', { tool_name, pattern: currentPattern, user, thread_ts });
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                behavior: 'allow' as const,
+                updatedInput: input,
+                message: `Auto-approved: matches previously approved pattern "${currentPattern}"`,
+              }),
+            },
+          ],
+        };
+      }
     }
 
     // Generate unique approval ID
@@ -325,10 +363,12 @@ class PermissionMCPServer {
             type: "button",
             text: {
               type: "plain_text",
-              text: "🔄 Always approve for thread"
+              text: "🔄 Always approve this command"
             },
             action_id: "approve_thread_always",
-            value: approvalId
+            // value encodes both the approvalId and the base command pattern,
+            // separated by "|". The slack-handler parses both on click.
+            value: `${approvalId}|${extractBaseCommandPattern(tool_name, input)}`
           }
         ]
       },

@@ -49,6 +49,18 @@ export class ClaudeHandler {
     return this.sessions.get(this.getSessionKey(userId, channelId, threadTs));
   }
 
+  // Returns true if ANY session (any user) has been active in this channel+thread.
+  // Used for thread-reply routing so the bot responds even if a different user
+  // is the one replying, or if the session was created under a slightly different key.
+  hasThreadSession(channelId: string, threadTs: string): boolean {
+    for (const session of this.sessions.values()) {
+      if (session.channelId === channelId && session.threadTs === threadTs) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   createSession(userId: string, channelId: string, threadTs?: string): ConversationSession {
     const session: ConversationSession = {
       userId,
@@ -68,7 +80,7 @@ export class ClaudeHandler {
     session?: ConversationSession,
     abortController?: AbortController,
     workingDirectory?: string,
-    slackContext?: { channel: string; threadTs?: string; user: string }
+    slackContext?: { channel: string; threadTs?: string; user: string; threadAutoApprovedPatterns?: string[] }
   ): AsyncGenerator<SDKMessage, void, unknown> {
     const options: any = {
       outputFormat: 'stream-json',
