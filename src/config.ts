@@ -17,6 +17,12 @@ export const config = {
   },
   baseDirectory: process.env.BASE_DIRECTORY || '',
   defaultWorkingDirectory: process.env.DEFAULT_WORKING_DIRECTORY || '',
+  yolo: {
+    globalLevel: parseInt(process.env.YOLO_LEVEL || '0', 10),
+    allowPerUser: process.env.YOLO_ALLOW_PER_USER === 'true',
+    allowPerChannel: process.env.YOLO_ALLOW_PER_CHANNEL === 'true',
+    allowPerThread: process.env.YOLO_ALLOW_PER_THREAD === 'true',
+  },
   // Use BOT_DEBUG (not DEBUG) — Anthropic's Claude Code SDK keys its own
   // verbose mode on `DEBUG`, and that mode dumps spawn args (including the
   // env block with our SLACK_BOT_TOKEN / APPROVAL_HMAC_SECRET) to stderr.
@@ -49,7 +55,7 @@ export function validateConfig() {
   ];
 
   const missing = required.filter((key) => !process.env[key]);
-  
+
   if (missing.length > 0) {
     throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
   }
