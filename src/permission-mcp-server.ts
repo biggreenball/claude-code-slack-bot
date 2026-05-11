@@ -277,6 +277,7 @@ class PermissionMCPServer {
     const denyReason = screenForDangerousCommand(tool_name, input);
     if (denyReason) {
       logger.warn('Hard-denied dangerous command', { tool_name, reason: denyReason, user });
+      this.notifySlack(channel, thread_ts, `🚫 *Auto-denied* \`${tool_name}\` — ${summarizeTool(tool_name, input)} _(${denyReason})_`);
       return {
         content: [
           {
@@ -304,6 +305,7 @@ class PermissionMCPServer {
       const level = this.yoloManager.getEffectiveYoloLevel(yoloContext);
       const levelDesc = YoloManager.getYoloLevelDescription(level);
       logger.info('YOLO auto-approved tool', { tool_name, level, levelDesc, user, thread_ts });
+      this.notifySlack(channel, thread_ts, `⚡ *Auto-approved (${levelDesc})* \`${tool_name}\` — \`${summarizeTool(tool_name, input)}\``);
       return {
         content: [
           {
@@ -327,6 +329,7 @@ class PermissionMCPServer {
       const currentPattern = extractBaseCommandPattern(tool_name, input);
       if (threadAutoApprovedPatterns.includes(currentPattern)) {
         logger.info('Auto-approving tool for thread (legacy pattern match)', { tool_name, pattern: currentPattern, user, thread_ts });
+        this.notifySlack(channel, thread_ts, `✅ *Auto-approved (remembered)* \`${tool_name}\` — \`${summarizeTool(tool_name, input)}\``);
         return {
           content: [
             {
@@ -551,6 +554,19 @@ class PermissionMCPServer {
     logger.info('Permission MCP server started with YOLO support');
   }
 
+  // Post a compact notification to Slack — fire-and-forget, never blocks the
+  // permission response. Skips silently if channel is missing.
+  private notifySlack(channel: string | undefined, thread_ts: string | undefined, text: string): void {
+    if (!channel) return;
+    this.slack.chat.postMessage({
+      channel,
+      thread_ts,
+      text,
+      unfurl_links: false,
+      unfurl_media: false,
+    }).catch((err: any) => logger.warn('notifySlack failed', { error: err?.message }));
+  }
+
   // Expose YOLO manager for external access
   getYoloManager(): YoloManager {
     return this.yoloManager;
@@ -633,6 +649,27 @@ export function writeApprovalDecision(
   const tmpPath = finalPath + '.tmp';
   fs.writeFileSync(tmpPath, JSON.stringify(signed), { mode: 0o600 });
   fs.renameSync(tmpPath, finalPath);
+}
+
+// One-line summary of a tool call for compact notification messages.
+function summarizeTool(toolName: string, input: any): string {
+  switch (toolName) {
+    case 'Bash': {
+      const cmd = (input?.command || '').trim().replace(/\s+/g, ' ');
+      return cmd.length > 100 ? cmd.slice(0, 100) + '…' : cmd;
+    }
+    case 'Write':
+    case 'Edit':
+    case 'MultiEdit':
+    case 'NotebookEdit':
+      return input?.file_path || input?.notebook_path || '';
+    case 'Task':
+      return input?.description ? input.description.slice(0, 80) : '';
+    default: {
+      const first = Object.entries(input || {}).find(([, v]) => typeof v === 'string');
+      return first ? `${first[0]}=${String(first[1]).slice(0, 60)}` : '';
+    }
+  }
 }
 
 // Pretty-print a tool invocation for the Slack approval card. Mirrors
