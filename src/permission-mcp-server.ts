@@ -11,6 +11,8 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Logger } from './logger.js';
+import { YoloManager, YoloLevel, YoloContext } from './yolo-manager.js';
+import { config } from './config.js';
 
 // Shared file-based IPC channel between the main bot process (button clicks
 // arrive there) and the permission-prompt MCP subprocess (which awaits the
@@ -88,14 +90,8 @@ function assertValidApprovalId(approvalId: string): void {
 }
 
 // Hard-deny patterns. Returns reason string if the request would terminate or
-// destroy the bot's own runtime, otherwise null. Checked BEFORE thread
-// auto-approval and BEFORE posting an approval card — even an auto-approved
-// thread can't push a self-kill through. Bypassable via sufficiently creative
-// shell tricks (write-then-run scripts, indirect via env vars, polyglot
-// payloads). This raises the bar against casual prompt injection but is NOT
-// a true sandbox — the real fix is non-root tool exec (see PUNCHLIST).
-// Conservative bias: false-deny is recoverable (SSH in); false-allow takes
-// the bot offline. Cap input length to bound regex work.
+// destroy the bot's own runtime, otherwise null. Checked BEFORE YOLO auto-approval
+// and BEFORE posting an approval card — even Full YOLO can't push these through.
 const MAX_SCREENED_CMD_LEN = 8192;
 
 const DENIED_BASH_PATTERNS: Array<{ re: RegExp; reason: string }> = [
@@ -116,9 +112,6 @@ const DENIED_BASH_PATTERNS: Array<{ re: RegExp; reason: string }> = [
   //     bypass attempts to "Claude has to be deliberately sneaky." ---
   { re: /\beval\b/i, reason: 'eval (indirect execution)' },
   { re: /\bbase64\s+(-d|-D|--decode|-i)\b/i, reason: 'base64 -d (decode-then-execute pattern)' },
-  // The `\b-[ce]\b` form does NOT match in practice because `-` is a non-word
-  // char and `\b` requires a word/non-word transition; `-c ` has only non-word
-  // chars on both sides of the `-`. Use whitespace-or-quote anchors instead.
   { re: /\b(python3?|node|perl|ruby)\b[^\n]*\s-[ce](?=[\s'"])[^\n]*\b(kill|exec|os\.kill|process\.kill|spawn|system)\b/i, reason: 'interpreter -c/-e invoking kill/exec/spawn' },
 ];
 
@@ -205,6 +198,7 @@ function screenForDangerousCommand(toolName: string, input: any): string | null 
 class PermissionMCPServer {
   private server: Server;
   private slack: WebClient;
+  private yoloManager: YoloManager;
 
   constructor() {
     this.server = new Server(
@@ -220,6 +214,7 @@ class PermissionMCPServer {
     );
 
     this.slack = new WebClient(process.env.SLACK_BOT_TOKEN);
+    this.yoloManager = new YoloManager(config.yolo);
     this.setupHandlers();
   }
 
@@ -275,10 +270,10 @@ class PermissionMCPServer {
     // Get Slack context from environment (passed by Claude handler)
     const slackContextStr = process.env.SLACK_CONTEXT;
     const slackContext = slackContextStr ? JSON.parse(slackContextStr) : {};
-    const { channel, threadTs: thread_ts, user, threadAutoApprovedPatterns } = slackContext;
+    const { channel, threadTs: thread_ts, user, threadAutoApprovedPatterns, workingDirectory } = slackContext;
 
     // Hard-deny self-kill / self-destroy commands BEFORE auto-approval kicks in.
-    // Even a thread the user opted into auto-approve can't push these through.
+    // Even Full YOLO can't push these through.
     const denyReason = screenForDangerousCommand(tool_name, input);
     if (denyReason) {
       logger.warn('Hard-denied dangerous command', { tool_name, reason: denyReason, user });
@@ -295,10 +290,35 @@ class PermissionMCPServer {
       };
     }
 
-    // If the current command matches a pattern the user previously approved for
-    // this thread, auto-approve it — but never for write/file-mutation tools.
-    // Pattern matching is scoped to executable+subcommand (e.g. "roadie-list add")
-    // so approving one roadie-list command doesn't blanket-approve all bash.
+    // Check YOLO auto-approval BEFORE thread pattern matching
+    const yoloContext: YoloContext = {
+      userId: user,
+      channelId: channel,
+      threadTs: thread_ts,
+      toolName: tool_name,
+      input,
+      workingDirectory,
+    };
+
+    if (this.yoloManager.shouldAutoApprove(yoloContext)) {
+      const level = this.yoloManager.getEffectiveYoloLevel(yoloContext);
+      const levelDesc = YoloManager.getYoloLevelDescription(level);
+      logger.info('YOLO auto-approved tool', { tool_name, level, levelDesc, user, thread_ts });
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify({
+              behavior: 'allow' as const,
+              updatedInput: input,
+              message: `YOLO auto-approved at ${levelDesc}`,
+            }),
+          },
+        ],
+      };
+    }
+
+    // Fall back to legacy thread auto-approval pattern matching
     if (
       Array.isArray(threadAutoApprovedPatterns) &&
       threadAutoApprovedPatterns.length > 0 &&
@@ -306,7 +326,7 @@ class PermissionMCPServer {
     ) {
       const currentPattern = extractBaseCommandPattern(tool_name, input);
       if (threadAutoApprovedPatterns.includes(currentPattern)) {
-        logger.info('Auto-approving tool for thread (pattern match)', { tool_name, pattern: currentPattern, user, thread_ts });
+        logger.info('Auto-approving tool for thread (legacy pattern match)', { tool_name, pattern: currentPattern, user, thread_ts });
         return {
           content: [
             {
@@ -366,8 +386,6 @@ class PermissionMCPServer {
               text: "🔄 Always approve this command"
             },
             action_id: "approve_thread_always",
-            // value encodes both the approvalId and the base command pattern,
-            // separated by "|". The slack-handler parses both on click.
             value: `${approvalId}|${extractBaseCommandPattern(tool_name, input)}`
           }
         ]
@@ -463,7 +481,7 @@ class PermissionMCPServer {
       };
     } catch (error) {
       logger.error('Error handling permission prompt:', error);
-      
+
       // Default to deny if there's an error
       const response: PermissionResponse = {
         behavior: 'deny',
@@ -530,7 +548,12 @@ class PermissionMCPServer {
   async run() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    logger.info('Permission MCP server started');
+    logger.info('Permission MCP server started with YOLO support');
+  }
+
+  // Expose YOLO manager for external access
+  getYoloManager(): YoloManager {
+    return this.yoloManager;
   }
 }
 
