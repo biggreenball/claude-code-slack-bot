@@ -85,6 +85,7 @@ export class ClaudeHandler {
     const options: any = {
       outputFormat: 'stream-json',
       permissionMode: slackContext ? 'default' : 'bypassPermissions',
+      model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
     };
 
     // Add permission prompt tool if we have Slack context
