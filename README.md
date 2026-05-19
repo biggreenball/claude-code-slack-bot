@@ -295,3 +295,59 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## License
 
 MIT
+
+---
+
+## TRC1 Deployment (Andy's instance)
+
+This bot is installed at `/opt/claude-slack-bridge` on TRC1 (Hetzner VM, `5.78.198.222`) and runs as **root** under systemd. Root is required because Claude Code needs unrestricted filesystem access to operate across all project directories.
+
+### Service management
+
+```bash
+# Status
+systemctl status claude-slack-bridge.service
+
+# Logs (live tail)
+journalctl -u claude-slack-bridge.service -f
+
+# Restart after config change
+systemctl restart claude-slack-bridge.service
+```
+
+### Config and secrets
+
+Secrets live at `/opt/claude-slack-bridge/.env` (root-owned, mode `0600`). Never paste secrets in chat — append via SSH:
+
+```bash
+ssh trc1 "umask 077 && printf 'KEY=value\n' >> /opt/claude-slack-bridge/.env"
+```
+
+Key env vars configured on TRC1:
+
+| Variable | Purpose |
+|----------|---------|
+| `SLACK_BOT_TOKEN` | Andy's personal Claude Code Slack app (`xoxb-...`) |
+| `SLACK_APP_TOKEN` | Socket Mode app token (`xapp-...`) |
+| `SLACK_SIGNING_SECRET` | Webhook signature verification |
+| `APPROVAL_HMAC_SECRET` | Out-of-band approval gating HMAC |
+| `ALLOWED_SLACK_USER_IDS` | Andy's Slack user ID (allowlist) |
+| `BASE_DIRECTORY` | `/opt/axel/` — base for relative `cwd` paths |
+| `YOLO_LEVEL` | Default approval level (0 = always prompt) |
+
+### Approval / YOLO gating
+
+The bot has a per-user, per-channel, per-thread YOLO level system. Level 0 (default) requires Andy to approve or deny every tool call. Levels 1–4 progressively auto-approve lower-risk operations. Configure per-session with `yolo <level>` in Slack.
+
+### Slack app
+
+The Slack app manifest is at `slack-app-manifest.json` / `slack-app-manifest.yaml`. The app is installed in Andy's personal Slack workspace and uses Socket Mode (no inbound webhook URL required).
+
+### Updating the bot
+
+```bash
+cd /opt/claude-slack-bridge
+git pull
+npm install
+systemctl restart claude-slack-bridge.service
+```
