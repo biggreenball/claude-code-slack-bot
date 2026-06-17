@@ -228,3 +228,17 @@ Potential areas for expansion:
 - Custom slash commands
 - Team-specific bot configurations
 - Analytics and usage tracking
+## Roadie roadmap operations (trc1-admin)
+
+When Andy asks in **trc1-admin** to apply a roadmap draft, or for a roadmap/Brian
+progress update, follow the runbook: **`/opt/axel/roadie/APPLY_RUNBOOK.md`**.
+
+- **Applying a daily draft:** read `/opt/axel/roadie/pending/latest-draft.json`,
+  reconcile with Andy's reply, apply via `roadie-list update --item-id <id> ... --approved`,
+  then post a Brian-ready summary (next bullet).
+- **Brian progress summary (always comprehensive, not just rows changed):** run
+  `roadie-brian-summary.py` (default window = since last summary) and synthesize the
+  output into a stakeholder-safe summary. For an explicit window like *"update since
+  last Friday"*, run `roadie-brian-summary.py --since YYYY-MM-DD`.
+- **Guardrail:** never mutate the Slack list except via `roadie-list ... --approved`
+  reflecting exactly what Andy approved.
