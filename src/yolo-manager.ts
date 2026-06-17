@@ -51,6 +51,9 @@ export class YoloManager {
     /^which(\s|$)/i,
     /^type(\s|$)/i,
     /^git\s+(status|log|show|diff|branch|remote)(\s|$)/i, // read-only git commands
+    // Roadie read-only ops (mutations roadie-list add/update stay gated):
+    /^roadie-list\s+(read|check|help)(\s|$)/i,
+    /^(python3\s+)?(\S*\/)?roadie-brian-summary\.py(\s|$)/i, // read-only Brian digest
   ];
 
   // Tools that require MEDIUM_RISK level
